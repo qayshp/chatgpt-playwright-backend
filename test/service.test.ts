@@ -163,3 +163,155 @@ test('shutdown while attachment is pending disconnects a late connection exactly
   const service=new ChatGPTService({connect:()=>new Promise(r=>{resolve=r;}),shutdownGraceMs:5});await service.start(0);
   const closing=service.close();await delay(10);resolve(adapter);await closing;assert.equal(adapter.disconnects,1);
 });
+
+test('successful browser actions remain successful when only the follow-up status check fails', async () => {
+  const h = await setup();
+  try {
+    h.adapter.getStatus = async () => { throw new AdapterError('DISCONNECTED', 'PRIVATE_DISCONNECT_DETAIL'); };
+    assert.equal((await h.post('/conversations')).status, 201);
+    assert.equal((await h.post('/conversation/open', { conversation: '87654321' })).status, 200);
+    assert.equal((await h.get('/turns')).status, 200);
+    assert.equal(h.adapter.navigations, 2);
+    const status = await (await h.get('/status')).json();
+    assert.equal(status.state, 'cdp_unavailable');
+    assert.equal(status.adapterStatusStale, true);
+    assert.equal(status.busy, false);
+    assert(!JSON.stringify(h.logs).includes('PRIVATE_DISCONNECT_DETAIL'));
+  } finally { await h.service.close(); }
+});
+
+test('HTTP and SSE diagnostics correlate requests without logging private content or caller-controlled URLs', async () => {
+  const h = await setup({ limits: { maxEvents: 2 } });
+  try {
+    h.adapter.status.conversation.title = 'PRIVATE_CHAT_TITLE';
+    const id = randomUUID();
+    const input = { message: 'PRIVATE_MESSAGE_BODY', requestId: id };
+    const response = await h.post('/messages', input);
+    const requestId = response.headers.get('x-request-id');
+    assert.match(requestId!, /^[a-f0-9-]{36}$/);
+    assert.equal((await response.json()).id, id);
+    await finalResult(h.get, id);
+    await h.post('/messages', input);
+    const replay = await h.get(`/operations/${id}/events`);
+    assert.equal(parseEvents(await replay.text())[0].type, 'reset');
+    const failed = await h.get('/PRIVATE_PATH?secret=PRIVATE_QUERY');
+    assert.equal(failed.status, 404);
+    assert.notEqual(failed.headers.get('x-request-id'), requestId);
+    const logs = await waitFor(async () => h.logs as Record<string, unknown>[], values => values.some(v => v.event === 'sse-closed'));
+    const accepted = logs.find(v => v.event === 'operation-accepted');
+    assert.equal(accepted?.requestId, requestId);
+    assert.equal(accepted?.operationId, id);
+    const finished = logs.find(v => v.event === 'operation-finished');
+    assert.equal(finished?.textSnapshots, 2);
+    assert.equal(finished?.contentSnapshots, 2);
+    assert.equal(finished?.submitted, true);
+    const stream = logs.find(v => v.event === 'sse-closed');
+    assert.equal(stream?.resets, 1);
+    assert.equal(stream?.terminal, true);
+    assert.equal(stream?.requestId, replay.headers.get('x-request-id'));
+    const encoded = JSON.stringify(logs);
+    for (const privateValue of ['PRIVATE_MESSAGE_BODY', 'PRIVATE_CHAT_TITLE', 'PRIVATE_PATH', 'PRIVATE_QUERY', 'Original answer', 'Revised answer', 'https://chatgpt.com']) assert(!encoded.includes(privateValue), privateValue);
+  } finally { await h.service.close(); }
+});
+
+test('an optional logger failure cannot break startup, sends, or cleanup', async () => {
+  const h = await setup({ logger: () => { throw new Error('Diagnostic sink unavailable'); } });
+  try {
+    const response = await h.post('/messages', { message: 'Fixture' });
+    assert.equal(response.status, 202);
+    assert.equal((await finalResult(h.get, (await response.json()).id)).state, 'completed');
+  } finally { await h.service.close(); }
+  assert.equal(h.adapter.disconnects, 1);
+});
+
+test('a disconnect failure still closes HTTP, clears retained operations, and reports stopped', async () => {
+  const h = await setup();
+  const id = (await (await h.post('/messages', { message: 'Fixture' })).json()).id;
+  await finalResult(h.get, id);
+  h.adapter.disconnect = async () => { h.adapter.disconnects++; throw new Error('PRIVATE_DISCONNECT_MESSAGE'); };
+  await assert.rejects(h.service.close(), /PRIVATE_DISCONNECT_MESSAGE/);
+  assert.equal(h.service.server.listening, false);
+  assert.equal(h.service.operations.find(id), undefined);
+  assert.equal((await h.service.status()).state, 'stopped');
+  assert.equal(h.adapter.disconnects, 1);
+  assert(!JSON.stringify(h.logs).includes('PRIVATE_DISCONNECT_MESSAGE'));
+});
+
+test('an occupied HTTP port is diagnosed without a misleading browser error or attachment attempt', async () => {
+  const h = await setup();
+  let connects = 0;
+  const second = new ChatGPTService({ connect: async () => { connects++; return new FakeAdapter(); } });
+  try {
+    await assert.rejects(second.start(Number(new URL(h.base).port)), (error: unknown) => error instanceof ServiceError && error.code === 'LISTEN_ADDRESS_IN_USE');
+    assert.equal(connects, 0);
+  } finally { await second.close(); await h.service.close(); }
+});
+
+test('SSE backpressure catches up through a reset and retains the final result', async () => {
+  const h = await setup({ limits: { maxEvents: 2 } });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  h.adapter.sendMessage = async function* (_message: string, options: SendOptions = {}): AsyncGenerator<ResponseEvent> {
+    const requestId = options.requestId!;
+    yield { type: 'submitted', requestId, conversation: h.adapter.status.conversation };
+    await gate;
+    for (let sequence = 1; sequence <= 24; sequence++) {
+      yield { type: 'text', requestId, text: 'x'.repeat(128 * 1024) + sequence, sequence, observedAt: Date.now(), elapsedMs: sequence };
+    }
+    yield { type: 'done', requestId, conversation: h.adapter.status.conversation, turn: makeTurn('Final replacement'), elapsedMs: 30, completionEvidence: ['fixture-complete'] };
+  };
+  try {
+    const id = (await (await h.post('/messages', { message: 'Fixture' })).json()).id;
+    const response = await h.get(`/operations/${id}/events`);
+    release();
+    const events = parseEvents(await response.text());
+    assert(events.some(event => event.type === 'reset'));
+    const last = events.at(-1)!;
+    assert.equal(last.type, 'reset');
+    assert.equal(last.data.operation.state, 'completed');
+    assert.equal(last.data.operation.result.turn.content.text, 'Final replacement');
+    const closed = await waitFor(async () => h.logs as Record<string, unknown>[], values => values.some(v => v.event === 'sse-closed'));
+    assert(Number(closed.find(v => v.event === 'sse-closed')?.backpressurePauses) > 0);
+    assert(h.service.operations.require(id).events.length <= 2);
+  } finally { release(); await h.service.close(); }
+});
+
+test('SSE subscriber limits reject excess connections and release disconnected slots', async () => {
+  const h = await setup(); h.adapter.mode = 'waiting';
+  const controllers: AbortController[] = [];
+  try {
+    const id = (await (await h.post('/messages', { message: 'Fixture' })).json()).id;
+    for (let i = 0; i < 32; i++) {
+      const controller = new AbortController(); controllers.push(controller);
+      assert.equal((await fetch(h.base + `/operations/${id}/events`, { signal: controller.signal })).status, 200);
+    }
+    assert.equal((await h.get(`/operations/${id}/events`)).status, 503);
+    controllers[0].abort();
+    await waitFor(async () => h.service.operations.require(id).listeners.size, count => count === 31);
+    const controller = new AbortController(); controllers.push(controller);
+    assert.equal((await fetch(h.base + `/operations/${id}/events`, { signal: controller.signal })).status, 200);
+    assert.equal(h.adapter.connects, 1);
+    assert.equal(h.adapter.sends, 1);
+  } finally { for (const controller of controllers) controller.abort(); await h.service.close(); }
+});
+
+test('initial browser health inspection shares the same exclusive tab reservation as API actions', async () => {
+  const adapter = new FakeAdapter();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const getStatus = adapter.getStatus.bind(adapter);
+  adapter.getStatus = async () => { await gate; return getStatus(); };
+  const service = new ChatGPTService({ connect: async () => adapter });
+  const base = await service.start(0);
+  try {
+    const status = await (await fetch(base + '/status')).json();
+    assert.equal(status.state, 'connecting');
+    assert.equal(status.activeOperation.kind, 'initialize');
+    assert.equal(status.adapterStatusStale, true);
+    const response = await fetch(base + '/conversations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(response.status, 409);
+    assert.equal(adapter.navigations, 0);
+    release(); await service.ready;
+    assert.equal((await (await fetch(base + '/status')).json()).state, 'usable');
+  } finally { release(); await service.close(); }
+});

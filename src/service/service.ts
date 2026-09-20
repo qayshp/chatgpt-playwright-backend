@@ -25,6 +25,13 @@ export interface ServiceOptions {
 }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BODY_LIMIT = 64 * 1024;
+// Never include user-controlled paths or query values in diagnostics.
+function routeLabel(rawURL: string | undefined): string {
+  const path = rawURL?.split('?')[0];
+  if (['/status', '/conversation', '/turns', '/conversations/recent', '/conversation/open', '/conversations', '/messages'].includes(path ?? '')) return path!;
+  const match = path?.match(/^\/operations\/[a-f0-9-]+(?:\/(events|cancel))?$/i);
+  return match ? `/operations/:id${match[1] ? `/${match[1]}` : ''}` : 'unknown';
+}
 const json = (res: ServerResponse, code: number, value: unknown) => {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end(JSON.stringify(value));
@@ -49,10 +56,7 @@ async function bodyJSON(req: IncomingMessage): Promise<Record<string, unknown>> 
 export class ChatGPTService {
   readonly instanceId = randomUUID();
   readonly operations: OperationStore;
-  readonly server = createServer((req, res) => { void this.route(req, res).catch(error => {
-    if (res.headersSent || res.destroyed) { res.destroy(); return; }
-    const e = publicError(error); json(res, e.httpStatus, { error: errorJSON(e) });
-  }); });
+  readonly server = createServer((req, res) => this.handle(req, res));
   ready: Promise<void> = Promise.resolve();
   private adapter?: AdapterPort;
   private health: HealthState = 'connecting';
@@ -68,7 +72,32 @@ export class ChatGPTService {
   private connectionAttempts = 0;
   private connectedAt?: string;
   constructor(private options: ServiceOptions) { this.operations = new OperationStore(options.limits); }
-  private log(event: string, data: Record<string, unknown> = {}) { this.options.logger?.({ event, at: new Date().toISOString(), ...data }); }
+  private log(event: string, data: Record<string, unknown> = {}) {
+    // Diagnostics must never turn a successful browser action into an API failure.
+    try { this.options.logger?.({ event, at: new Date().toISOString(), ...data }); } catch { /* Optional observer only. */ }
+  }
+  private handle(req: IncomingMessage, res: ServerResponse) {
+    const requestId = randomUUID();
+    const startedAt = performance.now();
+    const route = routeLabel(req.url);
+    const method = ['GET', 'POST', 'HEAD', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(req.method ?? '') ? req.method : 'OTHER';
+    res.setHeader('X-Request-ID', requestId);
+    this.log('http-request-started', { requestId, route, method });
+    let finished = false;
+    const record = (outcome: 'finished' | 'disconnected') => {
+      if (finished) return;
+      finished = true;
+      this.log('http-request-finished', { requestId, route, method, status: res.headersSent ? res.statusCode : undefined, outcome, elapsedMs: Math.round(performance.now() - startedAt) });
+    };
+    res.once('finish', () => record('finished'));
+    res.once('close', () => record('disconnected'));
+    void this.route(req, res).catch(error => {
+      const e = publicError(error);
+      this.log('http-request-failed', { requestId, route, code: e.code, status: e.httpStatus });
+      if (res.headersSent || res.destroyed) { res.destroy(); return; }
+      json(res, e.httpStatus, { error: errorJSON(e) });
+    });
+  }
   async start(port = 3210): Promise<string> {
     if (this.started) throw new Error('Service already started');
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid local port');
@@ -76,10 +105,15 @@ export class ChatGPTService {
     this.server.requestTimeout = 10_000;
     this.server.headersTimeout = 10_000;
     this.server.maxHeadersCount = 40;
-    await new Promise<void>((resolve, reject) => {
-      this.server.once('error', reject);
-      this.server.listen(port, '127.0.0.1', () => { this.server.off('error', reject); resolve(); });
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.server.once('error', reject);
+        this.server.listen(port, '127.0.0.1', () => { this.server.off('error', reject); resolve(); });
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') throw new ServiceError('LISTEN_ADDRESS_IN_USE', 'The local service port is already in use. Choose another CHATGPT_SERVICE_PORT or stop the other service.', 503);
+      throw new ServiceError('LISTEN_FAILED', 'The local HTTP listener could not start. Check the port and local permissions.', 503);
+    }
     this.port = (this.server.address() as { port: number }).port;
     this.janitor = setInterval(() => this.operations.prune(), 30_000); this.janitor.unref();
     this.ready = this.attachOnce();
@@ -93,7 +127,7 @@ export class ChatGPTService {
       if(this.closing){await adapter.disconnect({force:true});return;}
       this.adapter = adapter;
       this.connectedAt = new Date().toISOString();
-      if (!this.closing) await this.refreshStatus();
+      if (!this.closing) await this.exclusive('initialize', async () => undefined);
       this.log('service-attached', { instanceId: this.instanceId });
     } catch (error) { if (!this.closing) this.remember(error); }
   }
@@ -132,13 +166,17 @@ export class ChatGPTService {
     const active = this.reserve(kind);
     const task = (async () => {
       try {
-        const result = await action(this.adapter!); await this.refreshStatus(); return result;
+        const result = await action(this.adapter!);
+        // A failed follow-up health read cannot undo a successful mutation. Returning an
+        // error here invited clients to repeat an already completed navigation/new chat.
+        try { await this.refreshStatus(); } catch (error) { this.remember(error); }
+        return result;
       } catch (error) { throw this.remember(error); }
       finally { if (this.active === active) this.active = undefined; }
     })();
     active.task = task.then(() => {}, () => {}); return task;
   }
-  private send(body: Record<string, unknown>) {
+  private send(body: Record<string, unknown>, httpRequestId: string) {
     requireKeys(body, ['message', 'requestId', 'timeoutMs', 'expectedConversationId']);
     if (typeof body.message !== 'string' || !body.message.trim()) throw new ServiceError('INVALID_INPUT', 'message must be a nonempty string.');
     if (body.requestId !== undefined && (typeof body.requestId !== 'string' || !UUID.test(body.requestId))) throw new ServiceError('INVALID_INPUT', 'requestId must be a UUID.');
@@ -149,6 +187,7 @@ export class ChatGPTService {
       const old = this.operations.find(body.requestId as string);
       if (old) {
         if (old.fingerprint !== fingerprint) throw new ServiceError('REQUEST_ID_CONFLICT', 'requestId was used with different input.', 409);
+        this.log('operation-reused', { requestId: httpRequestId, operationId: old.id, state: old.view.state });
         return { operation: old.view, reused: true };
       }
     }
@@ -156,6 +195,7 @@ export class ChatGPTService {
     let op: Operation;
     try { op = this.operations.create(fingerprint, active.id); } catch (error) { this.active = undefined; throw error; }
     active.operation = op;
+    this.log('operation-accepted', { requestId: httpRequestId, operationId: op.id });
     active.task = this.runSend(op, body.message as string, {
       requestId: op.id, signal: op.controller.signal, includeContentSnapshots: true, timeoutMs: body.timeoutMs as number | undefined,
       ...(Object.hasOwn(body, 'expectedConversationId') ? { expectedConversationId: body.expectedConversationId as string | null } : {})
@@ -167,6 +207,8 @@ export class ChatGPTService {
     Object.assign(op.view, patch); op.publish(type, data);
   }
   private async runSend(op: Operation, message: string, options: SendOptions) {
+    const startedAt = performance.now();
+    let textSnapshots = 0; let contentSnapshots = 0; let submitted = false;
     try {
       let final: Extract<ResponseEvent,{type:'done'}> | undefined;
       for await (const event of this.adapter!.sendMessage(message, options)) {
@@ -174,11 +216,14 @@ export class ChatGPTService {
         if (event.requestId !== op.id) throw new ServiceError('REQUEST_ID_MISMATCH', 'Adapter response identity did not match this operation.', 500, 'dom_assumptions_failed');
         switch (event.type) {
           case 'submitted':
+            submitted = true;
             this.health='generating';
             this.update(op, 'submitted', { requestId: event.requestId, conversation: event.conversation }, { state: 'submitted', conversation: event.conversation }); break;
           case 'text':
+            textSnapshots++;
             this.update(op, 'snapshot', { requestId: event.requestId, text: event.text, sequence: event.sequence, observedAt: event.observedAt, elapsedMs: event.elapsedMs }, { state: 'streaming', text: event.text }); break;
           case 'content':
+            contentSnapshots++;
             this.update(op, 'content_snapshot', { requestId: event.requestId, turn: event.turn, elapsedMs: event.elapsedMs }, { state: 'streaming', content: event.turn }); break;
           case 'done': {
             final=event;break;
@@ -201,7 +246,7 @@ export class ChatGPTService {
       }
     } finally {
       message = ''; // Do not retain the submitted prompt in operation state.
-      this.log('operation-finished', { operationId: op.id, state: op.view.state });
+      this.log('operation-finished', { operationId: op.id, state: op.view.state, submitted, textSnapshots, contentSnapshots, elapsedMs: Math.round(performance.now() - startedAt), code: op.view.error?.code });
     }
   }
   private cancel(op: Operation) {
@@ -241,7 +286,7 @@ export class ChatGPTService {
       requireKeys(await bodyJSON(req), []); json(res, 201, await this.exclusive('new', a => a.createConversation())); return;
     }
     if (req.method === 'POST' && path === '/messages') {
-      const result = this.send(await bodyJSON(req)); const id = result.operation.id;
+      const result = this.send(await bodyJSON(req), String(res.getHeader('X-Request-ID'))); const id = result.operation.id;
       json(res, 202, { id, reused: result.reused, state: result.operation.state, eventsURL: `/operations/${id}/events`, resultURL: `/operations/${id}` }); return;
     }
     const match = path.match(/^\/operations\/([a-f0-9-]+)(?:\/(events|cancel))?$/i);
@@ -262,8 +307,17 @@ export class ChatGPTService {
     if (this.streams.size >= 32) throw new ServiceError('STREAM_LIMIT', 'Too many SSE clients.', 503);
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Content-Type-Options': 'nosniff', 'X-Accel-Buffering': 'no' }); res.flushHeaders();
     this.streams.add(res);
+    const requestId = res.getHeader('X-Request-ID');
+    const startedAt = performance.now();
+    let sentEvents = 0; let resets = 0; let backpressurePauses = 0;
+    this.log('sse-opened', { requestId, operationId: op.id, after });
     let cursor = after; let blocked = false;
-    const write = (id: number, type: string, data: unknown) => { cursor = id; blocked = !res.write(`id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`); };
+    const write = (id: number, type: string, data: unknown) => {
+      cursor = id; sentEvents++;
+      if (type === 'reset') resets++;
+      blocked = !res.write(`id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (blocked) backpressurePauses++;
+    };
     const pump = () => {
       if (res.destroyed || res.writableEnded || blocked) return;
       const replay = op.replay(cursor);
@@ -275,7 +329,10 @@ export class ChatGPTService {
     res.on('drain', drain); op.listeners.add(pump);
     const heartbeat = setInterval(() => { if (!blocked && !res.writableEnded) blocked = !res.write(': keepalive\n\n'); }, this.options.heartbeatMs ?? 15_000);
     heartbeat.unref();
-    res.once('close', () => { clearInterval(heartbeat); op.listeners.delete(pump); this.streams.delete(res); res.off('drain', drain); });
+    res.once('close', () => {
+      clearInterval(heartbeat); op.listeners.delete(pump); this.streams.delete(res); res.off('drain', drain);
+      this.log('sse-closed', { requestId, operationId: op.id, after, cursor, sentEvents, resets, backpressurePauses, terminal: terminal(op.view.state), elapsedMs: Math.round(performance.now() - startedAt) });
+    });
     pump();
   }
   close(): Promise<void> {
@@ -289,11 +346,19 @@ export class ChatGPTService {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([Promise.allSettled([this.ready, this.active?.task ?? Promise.resolve()]), new Promise<void>(resolve => { timer = setTimeout(resolve, this.options.shutdownGraceMs ?? 8000); })]);
     clearTimeout(timer);
-    if(this.adapter){await this.adapter.disconnect({ force: true });this.adapter=undefined;}
-    // A connection still pending at shutdown is disconnected when it eventually settles.
-    await this.ready;
-    for (const res of this.streams) res.end();
-    this.server.closeAllConnections(); await httpClosed;
-    this.operations.clear(); this.adapterStatus = undefined; this.health = 'stopped'; this.log('service-stopped');
+    try {
+      const adapter = this.adapter; this.adapter = undefined;
+      if (adapter) await adapter.disconnect({ force: true });
+      // A connection still pending at shutdown is disconnected when it eventually settles.
+      await this.ready;
+    } catch (error) {
+      this.log('service-disconnect-failed', { code: publicError(error).code });
+      throw error;
+    } finally {
+      // Cleanup still runs if the browser transport rejects its disconnect request.
+      for (const res of this.streams) res.end();
+      this.server.closeAllConnections(); await httpClosed;
+      this.operations.clear(); this.adapterStatus = undefined; this.health = 'stopped'; this.log('service-stopped');
+    }
   }
 }

@@ -21,13 +21,17 @@ Environment:
 | `CHATGPT_TAB_URL` | Exact URL of the already-open tab to select |
 | `CHATGPT_CONVERSATION` | Select an already-open tab by conversation ID or URL |
 | `CHATGPT_CDP_ENDPOINT` | `chrome` by default; explicit endpoints must be local loopback HTTP/WS URLs |
-| `CHATGPT_DIAGNOSTICS=1` | Opt-in adapter/operation metadata logging; never prompts or response bodies |
+| `CHATGPT_DIAGNOSTICS=1` | Opt-in adapter, HTTP request, operation, and SSE metadata logging; never prompts or response bodies |
 
 `SIGINT`/`SIGTERM` stops accepting connections, cancels active observation, waits for cleanup, closes SSE connections, and disconnects CDP without closing Chrome or its tab. A stuck browser operation gets an eight-second grace period before forced CDP disconnection. If attachment is still pending, shutdown waits for the bounded startup attempt (30-second timeout by default) and disconnects any late connection. Cancellation does not press ChatGPT's Stop button; browser generation can continue after service shutdown.
+
+HTTP connections and retained operations are cleaned up even if CDP disconnection rejects; the foreground command reports a failure exit status in that case. An occupied HTTP port produces `LISTEN_ADDRESS_IN_USE` before any browser attachment attempt; use another `CHATGPT_SERVICE_PORT` or stop the other service. Other listener startup failures use `LISTEN_FAILED`.
 
 ## Concurrency
 
 There is **no request queue**. One browser operation owns the tab at a time. While a send is active, a new send, navigation, new-chat creation, history enumeration, or visible-turn read returns **409 `BUSY`**. This also serializes short browser reads against navigation. Busy errors identify the active operation ID; `/status` provides its kind.
+
+The initial browser health inspection also reserves the tab (`activeOperation.kind: "initialize"`). Requests arriving during that inspection receive the same busy behavior. Once a navigation or other browser action has succeeded, a failed follow-up health check does not turn its HTTP response into a failure; `/status` records the health error separately. This prevents consumers from repeating a successful new-chat or navigation action solely because a later status read failed.
 
 Operation lookup, SSE subscriptions, cancellation, and request-ID reuse do not acquire the tab. `/status` remains available: while busy it returns the cached browser status with `adapterStatusStale: true`, alongside the current service state and active operation. When idle it refreshes browser status. No background polling or tab navigation is performed just for health checks.
 
@@ -35,7 +39,7 @@ Manual use or other automation is outside this process's mutex. Supply `expected
 
 ## HTTP routes
 
-Bodies must be JSON objects with `Content-Type: application/json`, including `{}` for empty POSTs. Unknown body fields are rejected. Request bodies are limited to **64 KiB**. Compressed bodies are not accepted. All responses are `Cache-Control: no-store`.
+Bodies must be JSON objects with `Content-Type: application/json`, including `{}` for empty POSTs. Unknown body fields are rejected. Request bodies are limited to **64 KiB**. Compressed bodies are not accepted. All responses are `Cache-Control: no-store` and include a server-generated **`X-Request-ID`** for correlating one HTTP request with opt-in diagnostics. This header is distinct from the send request's `requestId`, which is the operation ID and remains stable across retries or SSE reconnects. An incoming `X-Request-ID` is not trusted or echoed.
 
 | Method and route | Body / query | Success |
 | --- | --- | --- |
@@ -177,6 +181,18 @@ Nothing is persisted to disk for caching or replay. Defaults:
 
 No credentials, cookies, tokens, raw network traffic, or debugging endpoint are exported. The service does not expose arbitrary browser evaluation or a CDP proxy. Default logs are lifecycle/error codes only; opt-in diagnostics add metadata and counts, never message bodies. The standalone development diagnostic scripts retain their explicit opt-in behavior and are not HTTP endpoints.
 
+### Diagnosing a failure
+
+Run `CHATGPT_DIAGNOSTICS=1 npm run service` in the foreground while reproducing the issue. Logs are newline-delimited JSON on stderr. Redirect them to a local ignored log file only if you intentionally want a diagnostic recording; the service does not create log files itself.
+
+- `http-request-started` / `http-request-finished`: `requestId` matching the response header, method, route template, status, elapsed time, and whether the client disconnected. Unknown paths are labeled `unknown`; raw paths, query strings, headers, and request/response bodies are omitted.
+- `http-request-failed`: the same request ID and a sanitized error code. This also covers rejected input and busy requests.
+- `operation-accepted` / `operation-reused`: link the HTTP request ID to the stable `operationId`, allowing you to follow retries without message text.
+- `operation-finished`: operation state, submission confirmation, text/structured snapshot counts, elapsed time, and an error code if present.
+- `sse-opened` / `sse-closed`: request and operation IDs, starting/final cursor, number of events and resets, backpressure pauses, elapsed time, and whether the operation was terminal at disconnection. A nonterminal SSE close is a client observation disconnect; it does not cancel generation.
+
+For an issue report, capture the HTTP status and `X-Request-ID`, operation ID if one was allocated, sanitized `/status` fields (`state`, `busy`, `instanceId`, error code), and matching metadata log lines. `/status` can contain a conversation title/URL; avoid pasting its full response unless you intend to share those details. Logging is an optional observer: failures in a supplied logging callback do not interrupt browser actions or HTTP/SSE handling.
+
 Strict loopback Host validation and Origin/Fetch-Metadata checks reject browser cross-origin requests and DNS-rebinding Host names; no CORS allowance is emitted. This phase trusts local processes on the machine and has no bearer-token authentication. Do not reverse-proxy or expose it remotely without adding authenticated transport/access control in a later phase.
 
 ## Testing
@@ -188,4 +204,4 @@ npm test
 node --import tsx scripts/verify-service.ts --live
 ```
 
-The automated suite uses a fake adapter over real loopback HTTP/SSE, and DOM fixtures for browser behavior. It does not launch Chrome or send messages. The explicit live script creates a disposable chat, exercises browser operations, disconnects/reconnects SSE during generation, reads a late terminal replay, reopens that chat, and sends one follow-up. The service is stopped separately with Ctrl-C/SIGTERM to verify Chrome survives. See `SERVICE_VERIFICATION.md` for measured evidence.
+The automated suite uses a fake adapter over real loopback HTTP/SSE, and DOM fixtures for browser behavior. Service regressions cover startup reservations, status-read failures after successful actions, teardown after disconnect failure, occupied ports, diagnostic privacy and correlation, failed logging sinks, SSE backpressure/reset, subscriber limits, and disconnected subscriber cleanup in addition to ordinary send/replay/cancel behavior. It does not launch Chrome or send messages. The explicit live script creates a disposable chat, exercises browser operations, disconnects/reconnects SSE during generation, reads a late terminal replay, reopens that chat, and sends one follow-up. The service is stopped separately with Ctrl-C/SIGTERM to verify Chrome survives. See `SERVICE_VERIFICATION.md` for measured evidence.
