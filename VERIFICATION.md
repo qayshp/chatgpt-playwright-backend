@@ -71,3 +71,5 @@ The synthetic tests do not establish every ChatGPT layout, language, model, tool
 ## Remaining product work
 
 The requested backend proof of concept is implemented. A long-lived local service, SSE transport, ColorBerry frontend, and Beeper/Matrix bridge are deliberately not part of this phase. The next step is to wrap this adapter with one serialized tab owner and authenticated local transport, retaining request IDs and normalized content independently of any frontend.
+
+The subsequent persistent localhost HTTP/SSE service phase is documented separately in [docs/SERVICE_VERIFICATION.md](docs/SERVICE_VERIFICATION.md), with its lifecycle, reconnection, and shutdown evidence.

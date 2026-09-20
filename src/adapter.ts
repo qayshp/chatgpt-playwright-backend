@@ -20,8 +20,8 @@ export function conversationURL(value: string): string {
   u.search='';u.hash='';return u.href.replace(/\/$/,'');
 }
 function isChatGPT(url:string):boolean {try{return new URL(url).origin==='https://chatgpt.com';}catch{return false;}}
-interface ConnectOptions { endpoint?: string; conversation?: string; tabURL?: string; logger?: Logger; timeoutMs?: number }
-interface Drain {updates:{sequence:number;text:string;elapsedMs:number;observedAt:number}[];userId:string|null;assistantId:string|null;seenGenerating:boolean;done:boolean;error:string|null;turn?:Turn;evidence:string[]}
+export interface ConnectOptions { endpoint?: string; conversation?: string; tabURL?: string; logger?: Logger; timeoutMs?: number }
+interface Drain {updates:{sequence:number;text:string;elapsedMs:number;observedAt:number}[];userId:string|null;assistantId:string|null;seenGenerating:boolean;done:boolean;error:string|null;turn?:Turn;snapshot?:Turn;evidence:string[]}
 
 export class ChatGPTAdapter {
   private busy=false;
@@ -116,9 +116,12 @@ export class ChatGPTAdapter {
       if(!(await locators.history(this.page).isVisible())) {const button=locators.openSidebar(this.page);if(await button.count()!==1)throw new AdapterError('HISTORY_UNAVAILABLE','Open the chat sidebar before listing conversations.');await button.click();await locators.history(this.page).waitFor({state:'visible'});}
       type Scan={links:{title:string;url:string}[];scrollable:boolean;position:number;height:number};
       await this.call('history','start');started=true;await delay(150);
+      const historyReadyDeadline=Date.now()+5000;
       const found=new Map<string,Conversation>();let scrolls=0;let noProgress=0;let previous='';let stopReason:RecentConversations['stopReason']='max-scrolls';
       while(true) {
-        const scan=await this.call<Scan>('history','read');const before=found.size;
+        const scan=await this.call<Scan>('history','read');
+        if(found.size===0&&scan.links.length===0&&Date.now()<historyReadyDeadline){await delay(200);continue;}
+        const before=found.size;
         for(const link of scan.links) {try {const url=conversationURL(link.url);const id=idFromURL(url)!;if(!found.has(id))found.set(id,{id,url,title:link.title});}catch{ /* non-conversation sidebar links */ }}
         if(found.size>=limit){stopReason='limit';break;}
         if(!scan.scrollable){stopReason='no-scroll-container';break;}
@@ -136,7 +139,7 @@ export class ChatGPTAdapter {
   async *sendMessage(text:string,options:SendOptions={}):AsyncGenerator<ResponseEvent> {
     if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new AdapterError('INVALID_TIMEOUT', 'timeoutMs must be a positive finite number.');
     if(!text.trim())throw new AdapterError('EMPTY_MESSAGE','Message must not be empty.');
-    this.enter();const requestId=randomUUID();const started=Date.now();let observing=false;let clicked=false;let submitted=false;let navigationUnexpected=false;
+    this.enter();const requestId=options.requestId??randomUUID();const started=Date.now();let observing=false;let clicked=false;let submitted=false;let navigationUnexpected=false;
     let conversation:Conversation|undefined;
     let guard:ConversationGuard|undefined;
     let deliveredUpdates=0;let maxDeliveryDelayMs=0;
@@ -149,8 +152,9 @@ export class ChatGPTAdapter {
     try {
       await this.assertIdle();conversation=await this.getCurrentConversation();guard=new ConversationGuard(conversation.url);
       if('expectedConversationId' in options&&conversation.id!==options.expectedConversationId)throw new AdapterError('CONVERSATION_MISMATCH','Current conversation differs from the requested destination.');
+      await this.page.bringToFront();
       const baseline=await this.readVisibleTurns();const composer=await this.unique(locators.composer(this.page));
-      await this.call('observe',{requestId,baselineIds:baseline.map(t=>t.id),expectedText:text,settleMs:700});observing=true;
+      await this.call('observe',{requestId,baselineIds:baseline.map(t=>t.id),expectedText:text,settleMs:700,includeContentSnapshots:options.includeContentSnapshots??false});observing=true;
       this.page.on('framenavigated',navigation);
       if(options.signal?.aborted)throw new AdapterError('ABORTED','Request aborted before sending.');
       await composer.fill(text,{timeout:5000});
@@ -161,6 +165,7 @@ export class ChatGPTAdapter {
       if(navigationUnexpected||this.page.url()!==conversation.url)throw new AdapterError('CONVERSATION_CHANGED','The conversation changed before submission; no automatic retry.');
       if(options.signal?.aborted)throw new AdapterError('ABORTED','Request aborted before sending.');
       if(!await send.isEnabled())throw new AdapterError('SEND_DISABLED','The send button is disabled.');
+      // ChatGPT input needs the selected tab active; use the actual accessible button.
       clicked=true;await send.click({timeout:5000});this.emit('send-clicked',{requestId});
       const deadline=Date.now()+(options.timeoutMs??180000);
       while(Date.now()<deadline) {
@@ -171,6 +176,7 @@ export class ChatGPTAdapter {
         if(d.error)throw new AdapterError('GENERATION_FAILED','ChatGPT response could not be verified.',{reason:d.error});
         if(d.userId&&!submitted) {submitted=true;const current=await this.getCurrentConversation();if(conversation.id===null&&current.id)conversation=current;yield {type:'submitted',requestId,conversation:current};}
         for(const update of d.updates){deliveredUpdates++;maxDeliveryDelayMs=Math.max(maxDeliveryDelayMs,Date.now()-update.observedAt);yield {type:'text',requestId,...update};}
+        if(d.snapshot)yield {type:'content',requestId,turn:d.snapshot,elapsedMs:Date.now()-started};
         if(d.done&&d.turn) {
           const current=await this.getCurrentConversation();
           if(!guard.accept(current.url))throw new AdapterError('CONVERSATION_CHANGED','Conversation changed before completion.');
@@ -185,8 +191,8 @@ export class ChatGPTAdapter {
       this.emit('operation-failed',{requestId,code:error instanceof AdapterError?error.code:'PLAYWRIGHT_ERROR',submissionAttempted:clicked,submissionConfirmed:submitted});throw error;
     } finally {this.page.off('framenavigated',navigation);if(observing)await this.call('stop',requestId).catch(()=>{});this.busy=false;}
   }
-  async disconnect():Promise<void> {
-    if(this.busy)throw new AdapterError('BUSY','Finish or cancel the active iterator before disconnecting.');
+  async disconnect(options:{force?:boolean}={}):Promise<void> {
+    if(this.busy&&!options.force)throw new AdapterError('BUSY','Finish or cancel the active iterator before disconnecting.');
     if(this.closed)return;this.closed=true;
     try {await this.browser.close();} finally {await unlink(this.lockPath).catch(()=>{});this.emit('disconnected');}
   }

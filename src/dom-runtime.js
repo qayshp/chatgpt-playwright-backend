@@ -1,7 +1,8 @@
 /* This file is evaluated in the selected tab. No network, storage, cookies, or app internals. */
 (() => {
   const KEY = '__chatgptDOMAdapter_v1';
-  if (window[KEY]) return;
+  if (window[KEY]?.version === 2) return;
+  window[KEY]?.dispose?.();
   const S = {
     messages: '[data-message-author-role][data-message-id]',
     turn: '[data-testid^="conversation-turn-"], article',
@@ -110,7 +111,7 @@
   function observe(options) {
     if(active)throw Error('Observer already active');
     const baseline=new Set(options.baselineIds);
-    const a={requestId:options.requestId,baseline,expectedText:options.expectedText,started:Date.now(),queue:[],sequence:0,lastText:undefined,lastChange:Date.now(),seenGenerating:false,userId:null,assistantId:null,error:null,settled:false};
+    const a={includeContentSnapshots:options.includeContentSnapshots,lastSnapshotAt:0,lastSnapshotSignature:null,requestId:options.requestId,baseline,expectedText:options.expectedText,started:Date.now(),queue:[],sequence:0,lastText:undefined,lastChange:Date.now(),seenGenerating:false,userId:null,assistantId:null,error:null,settled:false};
     function sample() {
       a.settled=false;
       const s=state();
@@ -156,7 +157,12 @@
     if(!active||active.requestId!==requestId)throw Error('Observer missing or replaced');
     active.sample();
     const a=active;
-    return {updates:a.queue.splice(0),userId:a.userId,assistantId:a.assistantId,seenGenerating:a.seenGenerating,done:a.settled,error:a.error,turn:a.settled?a.turn:undefined,evidence:a.evidence};
+    let snapshot;
+    if(a.includeContentSnapshots&&a.turn&&(a.settled||Date.now()-a.lastSnapshotAt>=250)) {
+      const signature=JSON.stringify(a.turn);
+      if(signature!==a.lastSnapshotSignature){snapshot=a.turn;a.lastSnapshotSignature=signature;a.lastSnapshotAt=Date.now();}
+    }
+    return {snapshot,updates:a.queue.splice(0),userId:a.userId,assistantId:a.assistantId,seenGenerating:a.seenGenerating,done:a.settled,error:a.error,turn:a.settled?a.turn:undefined,evidence:a.evidence};
   }
   function stop(requestId) {if(active&&active.requestId===requestId){active.observer.disconnect();clearInterval(active.timer);active=null;}}
   let historyScroll;
@@ -173,5 +179,5 @@
     if(action==='restore'&&historyScroll){historyScroll.element.scrollTop=historyScroll.top;historyScroll=null;}
     return {links,scrollable:!!scroller,position:scroller?.scrollTop??0,height:scroller?.scrollHeight??0};
   }
-  window[KEY]={state,readTurns,observe,drain,stop,history,version:1};
+  window[KEY]={state,readTurns,observe,drain,stop,history,dispose:()=>{if(active)stop(active.requestId);},version:2};
 })();

@@ -18,6 +18,22 @@ The adapter uses `chromium.connectOverCDP('chrome', { noDefaults: true })`. Play
 
 For a non-default profile/debugging setup, `CHATGPT_CDP_ENDPOINT` can specify a loopback `ws://` or `http://` endpoint. Chrome's new UI-enabled endpoint may not provide `/json/version`; prefer `chrome` discovery instead of assuming `http://localhost:9222` will work.
 
+## Foreground local service
+
+```sh
+npm run service
+# Equivalent direct command for later supervision:
+node --import tsx src/service/main.ts
+```
+
+The service listens at `http://127.0.0.1:3210` and owns one persistent CDP connection and one selected ChatGPT tab. Approve Chrome's attachment prompt once at startup if requested. Multiple HTTP requests and SSE reconnects reuse that connection. Ctrl-C/SIGTERM disconnects the service without closing Chrome or its authenticated tab. No launchd setup is included.
+
+Use `GET /status`, `GET /conversation`, `GET /conversations/recent`, `GET /turns`, `POST /conversations`, and `POST /conversation/open` for browser operations. `POST /messages` returns an operation ID; `GET /operations/<id>/events` streams replaceable text and normalized-content snapshots, and `GET /operations/<id>` retrieves current/final state. Incompatible concurrent browser operations return **409 BUSY**; there is no queue. SSE reconnect supports `Last-Event-ID`, bounded replay, and a full-state reset after older events expire from the journal.
+
+See [the HTTP/SSE contract](docs/HTTP_API.md) for complete routes, JSON/event shapes, retention, health states, cancellation, security, and environment variables. [Service verification](docs/SERVICE_VERIFICATION.md) separates fixture coverage from live browser results.
+
+Sends activate the selected ChatGPT tab before clicking its accessible Send button. This can change the foreground tab: live testing found background-tab submission unreliable. Cancellation stops observation only; it does not press ChatGPT's Stop button. The service keeps operation contents in bounded memory for recovery, never in a disk cache. It trusts local processes and is not ready for remote exposure.
+
 ## Command line
 
 Run from this directory:
@@ -45,7 +61,7 @@ CHATGPT_CONVERSATION='CONVERSATION-ID' npm run cli -- status
 
 The command `open` navigates the already selected tab. Selection environment variables identify the **source** tab, not a destination to open automatically.
 
-Each CLI invocation connects and disconnects. Chrome may request approval each time. A future service should retain one adapter instance. For development, `npx tsx scripts/live-session.ts` provides a persistent newline-delimited JSON verification console; use `{"action":"status"}`, `{"action":"new"}`, `{"action":"send","text":"Hello"}`, `{"action":"read"}`, `{"action":"list","limit":40}`, `{"action":"open","url":"https://chatgpt.com/c/..."}`, and `{"action":"exit"}`. Its `inspect` action intentionally prints DOM fragments and is only for opt-in diagnosis.
+Each CLI invocation connects and disconnects. Chrome may request approval each time. Use the foreground service above to retain one adapter instance. For development, `npx tsx scripts/live-session.ts` provides a persistent newline-delimited JSON verification console; use `{"action":"status"}`, `{"action":"new"}`, `{"action":"send","text":"Hello"}`, `{"action":"read"}`, `{"action":"list","limit":40}`, `{"action":"open","url":"https://chatgpt.com/c/..."}`, and `{"action":"exit"}`. Its `inspect` action intentionally prints DOM fragments and is only for opt-in diagnosis.
 
 ## Backend interface
 
@@ -88,7 +104,7 @@ try {
 
 `createConversation()` opens the new-chat page; a durable conversation ID is normally assigned after the first message. The observed UI briefly uses `/c/WEB:<uuid>`. During that transition, `id` remains `null` and `provisional` is `true`; the `done` event provides the durable ID. The adapter permits this one-way transition while continuing to correlate the submitted user turn. A later change to a different durable conversation fails explicitly. `getStatus()` distinguishes authenticated, logged-out, and unknown states; merely seeing a textbox does not prove authentication.
 
-`sendMessage()` is an async generator. Execution starts when consumed. It yields `submitted`, zero or more `text` snapshots, and one `done`; failures throw `AdapterError` with a stable `code`. Breaking the iterator or aborting its `AbortSignal` cleans up observation but **does not press Stop** or cancel generation in ChatGPT. Check status before the next operation. Never automatically resend after an uncertain submission.
+`sendMessage()` is an async generator. Execution starts when consumed. It yields `submitted`, zero or more `text` snapshots, and one `done`; `includeContentSnapshots: true` additionally yields normalized `content` snapshots and `requestId` can supply the caller’s correlation ID; failures throw `AdapterError` with a stable `code`. Breaking the iterator or aborting its `AbortSignal` cleans up observation but **does not press Stop** or cancel generation in ChatGPT. Check status before the next operation. Never automatically resend after an uncertain submission.
 
 ## DOM knowledge and safeguards
 
@@ -112,7 +128,7 @@ Locks contain only the owning process ID and live under the system temporary dir
 
 A `MutationObserver` watches message and generation-control changes. Node drains updates every 75 ms; a 100 ms page-side heartbeat handles completion without further mutations. The queue is bounded to 256 text snapshots, so slow consumers may miss intermediate snapshots but still receive the latest full text. Events include an `observedAt` Unix timestamp in milliseconds. Completion diagnostics report the number of delivered updates and maximum DOM-observation-to-delivery delay. This is DOM streaming, not network interception. Background-tab timer throttling and large answers may increase latency.
 
-Recent-chat enumeration collects links on each bounded scroll, deduplicates IDs, and restores the original scroll position. It stops at the requested limit (maximum 200), maximum scroll count, or repeated lack of progress. It always returns `complete: false` because the UI cannot establish an authoritative history total. Pinned chats and sidebar groups can affect ordering; this is UI order, not a timestamp-sorted account export.
+Recent-chat enumeration allows up to five seconds for an initially empty sidebar to load, then collects links on each bounded scroll, deduplicates IDs, and restores the original scroll position. It stops at the requested limit (maximum 200), maximum scroll count, or repeated lack of progress. It always returns `complete: false` because the UI cannot establish an authoritative history total. Pinned chats and sidebar groups can affect ordering; this is UI order, not a timestamp-sorted account export.
 
 ## Content contract
 
@@ -124,8 +140,8 @@ Blocks include paragraphs, headings, ordered/unordered nested lists, code blocks
 
 ## Limitations and next step
 
-This prototype targets the English text-chat UI. UI experiments, localized labels, project/custom-GPT layouts, thinking/tool phases, refusal/error layouts, hidden/virtualized older turns, and citation widgets can change the observed DOM. Copy controls are evidence of a completed rendered turn, not a private protocol guarantee. A user manually stopping a response or editing the chat concurrently may produce states that need additional handling. No background daemon, HTTP endpoint, ColorBerry frontend, or Matrix/Beeper bridge is included.
+This prototype targets the English text-chat UI. UI experiments, localized labels, project/custom-GPT layouts, thinking/tool phases, refusal/error layouts, hidden/virtualized older turns, and citation widgets can change the observed DOM. Copy controls are evidence of a completed rendered turn, not a private protocol guarantee. A user manually stopping a response or editing the chat concurrently may produce states that need additional handling. No background daemon, ColorBerry frontend, or Matrix/Beeper bridge is included. The HTTP service remains separate from the independently usable browser adapter.
 
-The next step is a single long-lived local service that owns one tab, serializes work, assigns request IDs, and exposes these events over SSE or another local transport. Add authentication to that service before exposing it outside loopback. Keep the browser adapter and normalized content schema independent of either future frontend.
+The next step is a small consumer of the documented HTTP/SSE contract, plus authenticated access control before any remote exposure. First keep exercising service recovery against browser UI changes and retain explicit snapshot replacement in every consumer. The browser adapter and normalized content schema remain independent of either future frontend.
 
 Live verification passed on 2026-09-20: new-chat send/stream, direct conversation navigation and a second send/stream, normalized content including real citations, and 60 recent chats across lazy loading. One test delivered 63 snapshots with a measured maximum observation-to-delivery delay of 77 ms. See `VERIFICATION.md` for the evidence and limits of these measurements.

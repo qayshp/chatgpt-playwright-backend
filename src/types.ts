@@ -35,8 +35,9 @@ export interface RecentConversations {
 export type ResponseEvent =
   | { type: 'submitted'; requestId: string; conversation: Conversation }
   | { type: 'text'; requestId: string; sequence: number; text: string; elapsedMs: number; observedAt: number }
+  | { type: 'content'; requestId: string; turn: Turn; elapsedMs: number }
   | { type: 'done'; requestId: string; conversation: Conversation; turn: Turn; elapsedMs: number; completionEvidence: string[] };
-export interface SendOptions { timeoutMs?: number; signal?: AbortSignal; expectedConversationId?: string | null }
+export interface SendOptions { requestId?: string; includeContentSnapshots?: boolean; timeoutMs?: number; signal?: AbortSignal; expectedConversationId?: string | null }
 export type Logger = (event: {event: string; at: string; [key: string]: unknown}) => void;
 export class AdapterError extends Error {
   constructor(public code: string, message: string, public details?: Record<string, unknown>) { super(message); this.name = 'AdapterError'; }

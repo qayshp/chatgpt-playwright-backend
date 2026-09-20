@@ -91,3 +91,13 @@ test('thinking placeholders do not become answer text',()=>{
   assert.equal(r.drain('r').updates.length,0);
  }finally{dom.window.close();}
 });
+test('opt-in normalized snapshots include structural changes even when text is unchanged',()=>{
+ const {dom,w,r}=fixture();try {
+  r.observe({requestId:'structured',baselineIds:[],expectedText:'Test',settleMs:0,includeContentSnapshots:true});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',user+answer('Same text',true));
+  const first=r.drain('structured');assert.equal(first.snapshot.content.blocks[0].type,'paragraph');
+  const p=w.document.querySelector('.markdown p')!;const h=w.document.createElement('h2');h.textContent=p.textContent;p.replaceWith(h);
+  const next=r.drain('structured');assert.equal(next.snapshot.content.blocks[0].type,'heading');assert.equal(next.updates.length,0);
+  assert.equal(r.drain('structured').snapshot,undefined);
+ }finally{dom.window.close();}
+});
