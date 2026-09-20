@@ -315,3 +315,17 @@ test('initial browser health inspection shares the same exclusive tab reservatio
     assert.equal((await (await fetch(base + '/status')).json()).state, 'usable');
   } finally { release(); await service.close(); }
 });
+
+test('failure to disconnect a late attachment is reported after HTTP cleanup', async () => {
+  const adapter = new FakeAdapter();
+  adapter.disconnect = async () => { adapter.disconnects++; throw new Error('PRIVATE_LATE_DISCONNECT'); };
+  let resolve!: (adapter: AdapterPort) => void;
+  const service = new ChatGPTService({ connect: () => new Promise(r => { resolve = r; }), shutdownGraceMs: 5 });
+  await service.start(0);
+  const closing = service.close();
+  const rejected = assert.rejects(closing, /PRIVATE_LATE_DISCONNECT/);
+  await delay(10); resolve(adapter); await rejected;
+  assert.equal(service.server.listening, false);
+  assert.equal((await service.status()).state, 'stopped');
+  assert.equal(adapter.disconnects, 1);
+});

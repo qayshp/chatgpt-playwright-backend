@@ -71,6 +71,7 @@ export class ChatGPTService {
   private started = false;
   private connectionAttempts = 0;
   private connectedAt?: string;
+  private attachmentShutdownError?: unknown;
   constructor(private options: ServiceOptions) { this.operations = new OperationStore(options.limits); }
   private log(event: string, data: Record<string, unknown> = {}) {
     // Diagnostics must never turn a successful browser action into an API failure.
@@ -124,7 +125,11 @@ export class ChatGPTService {
     this.connectionAttempts++;
     try {
       const adapter = await this.options.connect();
-      if(this.closing){await adapter.disconnect({force:true});return;}
+      if (this.closing) {
+        try { await adapter.disconnect({ force: true }); }
+        catch (error) { this.attachmentShutdownError = error; }
+        return;
+      }
       this.adapter = adapter;
       this.connectedAt = new Date().toISOString();
       if (!this.closing) await this.exclusive('initialize', async () => undefined);
@@ -351,6 +356,7 @@ export class ChatGPTService {
       if (adapter) await adapter.disconnect({ force: true });
       // A connection still pending at shutdown is disconnected when it eventually settles.
       await this.ready;
+      if (this.attachmentShutdownError) throw this.attachmentShutdownError;
     } catch (error) {
       this.log('service-disconnect-failed', { code: publicError(error).code });
       throw error;
