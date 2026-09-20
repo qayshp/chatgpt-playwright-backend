@@ -21,3 +21,24 @@ test('invalid CLI commands and missing messages fail before requesting Chrome at
   assert.equal(p.status,1);assert.equal(p.stdout,'');assert(!p.stderr.includes('INVALID_ENDPOINT'));assert(!p.stderr.includes('connecting'));assert.match(p.stderr,/INVALID_COMMAND|EMPTY_MESSAGE|INVALID_ARGUMENT|INVALID_CONVERSATION|INVALID_LIMIT|MESSAGE_READ_FAILED/);
  }
 });
+
+test('CLI disconnect failures are sanitized after successful and failed commands',()=>{
+ for(const operationFails of [false,true]){
+  // Replace attachment in the subprocess before loading the CLI. No CDP request occurs.
+  const script=`
+   import { ChatGPTAdapter } from './src/index.ts';
+   process.argv=[process.execPath,'src/cli.ts','status'];
+   ChatGPTAdapter.connect=async()=>({
+    getStatus:async()=>{if(${operationFails})throw Error('PRIVATE OPERATION at https://private.test/token');return {connected:true};},
+    disconnect:async()=>{throw Error('PRIVATE DISCONNECT at ws://127.0.0.1/private-endpoint');},
+   });
+   await import('./src/cli.ts');
+  `;
+  const p=spawnSync(process.execPath,['--import','tsx','--input-type=module','--eval',script],{cwd:new URL('..',import.meta.url),encoding:'utf8'});
+  assert.equal(p.status,1);
+  assert.equal(p.stdout,operationFails?'':'{"connected":true}\n');
+  const errors=p.stderr.trim().split('\n').map(line=>JSON.parse(line));
+  assert.equal(errors.length,operationFails?2:1);assert(errors.every(e=>e.error==='ADAPTER_FAILURE'));
+  assert(!p.stderr.includes('PRIVATE'));assert(!p.stderr.includes('private-endpoint'));assert(!p.stderr.includes('private.test'));
+ }
+});

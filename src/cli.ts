@@ -49,4 +49,7 @@ try {
   default:throw new Error(`Unknown command: ${command}. Use help.`);
  }
 }catch(e){process.stderr.write(JSON.stringify(diagnosticError(e))+'\n');process.exitCode=1;}
-finally{await adapter?.disconnect();}
+finally{
+ try{await adapter?.disconnect();}
+ catch(e){process.stderr.write(JSON.stringify(diagnosticError(e))+'\n');process.exitCode=1;}
+}

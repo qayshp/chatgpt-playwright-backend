@@ -55,7 +55,12 @@ export class ChatGPTAdapter {
       catch(e) {if((e as NodeJS.ErrnoException).code==='EEXIST') {lockPath=undefined;throw new AdapterError('TAB_LOCKED','Another adapter may own this tab. If a previous adapter crashed, inspect and remove its stale lock in the system temporary directory.');}throw e;}
       const adapter=new ChatGPTAdapter(browser,page,log,lockPath);
       await adapter.inject();await adapter.call('dispose');adapter.emit('connected',{browserVersion:browser.version()});return adapter;
-    } catch(e) {await browser.close();if(lockPath)await unlink(lockPath).catch(()=>{});throw e;}
+    } catch(e) {
+      // A detach failure must not mask the attachment failure or strand our lock.
+      await browser.close().catch(()=>{});
+      if(lockPath)await unlink(lockPath).catch(()=>{});
+      throw e;
+    }
   }
   private assertPage() {if(this.closed||!this.browser.isConnected()||this.page.isClosed())throw new AdapterError('DISCONNECTED','The selected page or adapter is closed.');if(!isChatSurfaceURL(this.page.url()))throw new AdapterError('WRONG_PAGE','The selected tab is no longer on a supported ChatGPT conversation surface.');}
   private async inject() {this.assertPage();await this.page.evaluate(await runtimeSource);}

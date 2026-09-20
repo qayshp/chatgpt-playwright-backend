@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { chromium } from 'playwright';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile, stat, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ChatGPTAdapter, AdapterError } from '../src/index.js';
 // A narrow fake page verifies that guard failures cannot reach browser mutations.
 function harness(overrides:Record<string,unknown>={}) {
@@ -79,4 +84,22 @@ test('forced disconnect disposes page observation before detaching and never clo
  await assert.rejects(adapter.disconnect(),code('BUSY'));assert.equal(order.length,0);
  await adapter.disconnect({force:true});await adapter.disconnect({force:true});
  assert.deepEqual(order,['dispose','disconnect']);assert(JSON.stringify(logs).includes('observer-cleanup'));
+});
+
+test('failed attachment preserves the original error and removes its lock when detach also fails',async t=>{
+ const targetId=`fixture-${randomUUID()}`;
+ const lockPath=join(tmpdir(),`chatgpt-browser-adapter-${process.getuid?.()??'local'}`,createHash('sha256').update(targetId).digest('hex')+'.lock');
+ t.after(()=>unlink(lockPath).catch(()=>{}));
+ const original=new AdapterError('FIXTURE_ATTACH_FAILURE','Injected runtime failed.');
+ let detachAttempts=0;let cdpDetached=false;let checkedOwnedLock=false;
+ const page={
+  url:()=> 'https://chatgpt.com/c/12345678',isClosed:()=>false,
+  context:()=>({newCDPSession:async()=>({send:async()=>({targetInfo:{targetId}}),detach:async()=>{cdpDetached=true;}})}),
+  evaluate:async()=>{assert.equal(await readFile(lockPath,'utf8'),String(process.pid));checkedOwnedLock=true;throw original;},
+ };
+ const browser={contexts:()=>[{pages:()=>[page]}],isConnected:()=>true,close:async()=>{detachAttempts++;throw Error('Secondary transport cleanup failed');}};
+ t.mock.method(chromium,'connectOverCDP',async()=>browser as any);
+ await assert.rejects(ChatGPTAdapter.connect(),error=>error===original);
+ assert(checkedOwnedLock);assert(cdpDetached);assert.equal(detachAttempts,1);
+ await assert.rejects(stat(lockPath),{code:'ENOENT'});
 });
