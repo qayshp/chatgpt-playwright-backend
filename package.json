@@ -1,0 +1,25 @@
+{
+  "name": "chatgpt-browser-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DOM-only adapter for an existing authenticated ChatGPT Chrome session",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "cli": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "devDependencies": {
+    "@types/jsdom": "30.0.0",
+    "@types/node": "26.6.2",
+    "jsdom": "30.1.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

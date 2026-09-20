@@ -1,0 +1,47 @@
+# Dependencies and package-manager caches
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build output and test reports
+dist/
+build/
+coverage/
+*.tsbuildinfo
+playwright-report/
+playwright/.cache/
+test-results/
+artifacts/
+
+# Local configuration and secrets (keep shareable examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Browser authentication/session data; never commit a real browser profile
+playwright/.auth/
+/auth.json
+/storage-state*.json
+/storageState*.json
+/browser-profiles/
+/user-data-dir/
+
+# Logs, temporary files, and caches
+*.log
+.cache/
+.tmp/
+tmp/
+*.swp
+*.swo
+*~
+
+# OS and editor-local files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
