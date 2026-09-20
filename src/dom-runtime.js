@@ -1,7 +1,7 @@
 /* This file is evaluated in the selected tab. No network, storage, cookies, or app internals. */
 (() => {
   const KEY = '__chatgptDOMAdapter_v1';
-  if (window[KEY]?.version === 2) return;
+  if (window[KEY]?.version === 3) return;
   window[KEY]?.dispose?.();
   const S = {
     messages: '[data-message-author-role][data-message-id]',
@@ -17,7 +17,7 @@
     markdown: '.markdown',
     citation: '[data-citation-id], [data-testid*="citation"], [data-state] a[target="_blank"]',
   };
-  const visible = e => !!e && !e.hidden && e.getAttribute('aria-hidden') !== 'true' && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none';
+  const visible = e => !!e && !e.closest('[hidden],[aria-hidden="true"]') && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none';
   const visibleAll = selector => Array.from(document.querySelectorAll(selector)).filter(visible);
   const safeURL = value => { if (!value) return undefined; try { const u=new URL(value, location.href);return /^(https?:|mailto:)$/.test(u.protocol)?u.href:undefined; } catch {return undefined;} };
   const skipped = e => e.matches('script,style,svg,button,nav,[aria-hidden="true"],.sr-only') && !e.matches(S.citation);
@@ -97,7 +97,7 @@
     if(message.getAttribute('data-message-author-role')==='assistant'&&!roots.length)warnings.push('Markdown container not found; using semantic descendants and visible text.');
     return {schemaVersion:1,text:targets.map(cleanText).join('\n\n').trim(),blocks:targets.flatMap(blocks),warnings};
   }
-  function readTurns() {return Array.from(document.querySelectorAll(S.messages)).filter(e=>!e.closest('[aria-hidden="true"]')).map(e=>({id:e.getAttribute('data-message-id'),role:e.getAttribute('data-message-author-role'),content:content(e)}));}
+  function readTurns() {return visibleAll(S.messages).map(e=>({id:e.getAttribute('data-message-id'),role:e.getAttribute('data-message-author-role'),content:content(e)}));}
   function state() {
     const composers=visibleAll(S.composer);
     const loggedOut=Array.from(document.querySelectorAll('button,a')).some(e=>visible(e)&&/^(Log in|Sign in|Sign up)$/i.test((e.textContent||'').trim()));
@@ -111,12 +111,12 @@
   function observe(options) {
     if(active)throw Error('Observer already active');
     const baseline=new Set(options.baselineIds);
-    const a={includeContentSnapshots:options.includeContentSnapshots,lastSnapshotAt:0,lastSnapshotSignature:null,requestId:options.requestId,baseline,expectedText:options.expectedText,started:Date.now(),queue:[],sequence:0,lastText:undefined,lastChange:Date.now(),seenGenerating:false,userId:null,assistantId:null,error:null,settled:false};
+    const a={samples:0,mutationBatches:0,droppedSnapshots:0,generating:false,lastContentSignature:null,includeContentSnapshots:options.includeContentSnapshots,lastSnapshotAt:0,lastSnapshotSignature:null,requestId:options.requestId,baseline,expectedText:options.expectedText,started:Date.now(),queue:[],sequence:0,lastText:undefined,lastChange:Date.now(),seenGenerating:false,userId:null,assistantId:null,error:null,settled:false};
     function sample() {
-      a.settled=false;
-      const s=state();
+      a.settled=false;a.samples++;
+      const s=state();a.generating=s.generating;
       if(s.generating)a.seenGenerating=true;
-      const messages=Array.from(document.querySelectorAll(S.messages));
+      const messages=visibleAll(S.messages);
       const freshUsers=messages.filter(e=>!baseline.has(e.getAttribute('data-message-id'))&&e.getAttribute('data-message-author-role')==='user');
       if(freshUsers.length>1) a.error='concurrent-user-message';
       if(a.userId&&freshUsers.length===0)a.error='submitted-turn-lost';
@@ -131,24 +131,27 @@
         if(assistant) {
           a.assistantId=assistant.getAttribute('data-message-id');
           const answer=content(assistant);
+          const signature=JSON.stringify(answer);
+          if(signature!==a.lastContentSignature){a.lastContentSignature=signature;a.lastChange=Date.now();}
           if(answer.text!==a.lastText) {
+            const hadSnapshot=a.lastText!==undefined;
             a.lastText=answer.text;a.lastChange=Date.now();
-            if(answer.text)a.queue.push({sequence:++a.sequence,text:answer.text,elapsedMs:Date.now()-a.started,observedAt:Date.now()});
-            if(a.queue.length>256) a.queue.splice(0,a.queue.length-256); // Bounded snapshots, no unbounded backlog.
+            if(answer.text||hadSnapshot)a.queue.push({sequence:++a.sequence,text:answer.text,elapsedMs:Date.now()-a.started,observedAt:Date.now()});
+            if(a.queue.length>256){const dropped=a.queue.length-256;a.droppedSnapshots+=dropped;a.queue.splice(0,dropped);} // Bounded snapshots, no unbounded backlog.
           }
           const article=assistant.closest(S.turn);
           const finishedControl=!!article&&Array.from(article.querySelectorAll(S.copy)).some(visible);
           const streaming=!!article?.querySelector('[data-is-streaming="true"], .result-streaming');
           a.settled=!!answer.text&&!s.generating&&!streaming&&finishedControl&&Date.now()-a.lastChange>=options.settleMs;
           a.turn={id:a.assistantId,role:'assistant',content:answer};
-          a.evidence=finishedControl?['assistant-copy-control','stop-control-absent','streaming-marker-absent','text-settled']:[];
+          a.evidence=finishedControl?['assistant-copy-control','stop-control-absent','streaming-marker-absent','text-settled','content-settled']:[];
         }
       }
       if(s.login==='logged-out')a.error='logged-out';
       if(s.reason==='challenge'||s.reason==='page-error')a.error=s.reason;
     }
     let scheduled=false;
-    a.observer=new MutationObserver(()=>{if(!scheduled){scheduled=true;queueMicrotask(()=>{scheduled=false;sample();});}});
+    a.observer=new MutationObserver(()=>{a.mutationBatches++;if(!scheduled){scheduled=true;queueMicrotask(()=>{scheduled=false;sample();});}});
     a.observer.observe(document.querySelector('main')||document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['disabled','aria-disabled','data-is-streaming','data-testid','aria-label','class']});
     a.timer=setInterval(sample,100); // Completion can change without another text mutation.
     a.sample=sample;active=a;sample();
@@ -162,7 +165,7 @@
       const signature=JSON.stringify(a.turn);
       if(signature!==a.lastSnapshotSignature){snapshot=a.turn;a.lastSnapshotSignature=signature;a.lastSnapshotAt=Date.now();}
     }
-    return {snapshot,updates:a.queue.splice(0),userId:a.userId,assistantId:a.assistantId,seenGenerating:a.seenGenerating,done:a.settled,error:a.error,turn:a.settled?a.turn:undefined,evidence:a.evidence};
+    return {diagnostics:{samples:a.samples,mutationBatches:a.mutationBatches,droppedSnapshots:a.droppedSnapshots,generating:a.generating,userDetected:!!a.userId,assistantDetected:!!a.assistantId},snapshot,updates:a.queue.splice(0),userId:a.userId,assistantId:a.assistantId,seenGenerating:a.seenGenerating,done:a.settled,error:a.error,turn:a.settled?a.turn:undefined,evidence:a.evidence};
   }
   function stop(requestId) {if(active&&active.requestId===requestId){active.observer.disconnect();clearInterval(active.timer);active=null;}}
   let historyScroll;
@@ -179,5 +182,5 @@
     if(action==='restore'&&historyScroll){historyScroll.element.scrollTop=historyScroll.top;historyScroll=null;}
     return {links,scrollable:!!scroller,position:scroller?.scrollTop??0,height:scroller?.scrollHeight??0};
   }
-  window[KEY]={state,readTurns,observe,drain,stop,history,dispose:()=>{if(active)stop(active.requestId);},version:2};
+  window[KEY]={state,readTurns,observe,drain,stop,history,dispose:()=>{if(active)stop(active.requestId);},version:3};
 })();

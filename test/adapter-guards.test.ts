@@ -34,3 +34,49 @@ test('history waits for initially empty lazy-loaded links instead of returning p
  };
  const result=await h.adapter.listRecentConversations({limit:1});assert.equal(result.conversations[0].title,'Loaded');assert.equal(scans,2);assert(restored);
 });
+
+test('an attached tab that leaves a chat surface is rejected before reading or mutating it',async()=>{
+ let touched=false;
+ const page={url:()=> 'https://chatgpt.com/finances',isClosed:()=>false,title:async()=>{touched=true;return 'Other product';},evaluate:async()=>{touched=true;}};
+ const adapter=new (ChatGPTAdapter as any)({isConnected:()=>true},page,()=>{},'unused') as ChatGPTAdapter;
+ await assert.rejects(adapter.getCurrentConversation(),code('WRONG_PAGE'));
+ await assert.rejects(adapter.getStatus(),code('WRONG_PAGE'));
+ await assert.rejects(adapter.sendMessage('must not send').next(),code('WRONG_PAGE'));
+ assert.equal(touched,false);
+});
+test('conversation identity cannot mix a URL and title across navigation',async()=>{
+ let url='https://chatgpt.com/c/12345678';
+ const page={url:()=>url,isClosed:()=>false,title:async()=>{url='https://chatgpt.com/c/87654321';return 'Different conversation';}};
+ const adapter=new (ChatGPTAdapter as any)({isConnected:()=>true},page,()=>{},'unused') as ChatGPTAdapter;
+ await assert.rejects(adapter.getCurrentConversation(),code('CONVERSATION_CHANGED'));
+});
+test('drafts or navigation appearing after initial readiness cannot reach composer fill',async()=>{
+ for(const cause of ['draft','navigation'] as const){
+  let url='https://chatgpt.com/c/12345678';let fills=0;let stopped=false;
+  const locator={filter:()=>({})};
+  const page={url:()=>url,isClosed:()=>false,on:()=>{},off:()=>{},bringToFront:async()=>{},getByRole:()=>locator,locator:()=>locator};
+  const adapter=new (ChatGPTAdapter as any)({isConnected:()=>true},page,()=>{},'unused') as ChatGPTAdapter;
+  adapter.getStatus=async()=>({connected:true,login:'authenticated',usable:true,generating:false,draftPresent:false,composerCount:1,conversation:{id:'12345678',url,title:'Test'}});
+  adapter.getCurrentConversation=async()=>({id:'12345678',url,title:'Test'});
+  adapter.readVisibleTurns=async()=>{if(cause==='navigation')url='https://chatgpt.com/c/87654321';return [];};
+  (adapter as any).unique=async()=>({evaluate:async()=>cause==='draft'?'A newly typed human draft':'',fill:async()=>{fills++;}});
+  (adapter as any).call=async(method:string)=>{if(method==='stop')stopped=true;};
+  await assert.rejects(adapter.sendMessage('Automated message').next(),code(cause==='draft'?'DRAFT_PRESENT':'CONVERSATION_CHANGED'));
+  assert.equal(fills,0);assert(stopped);
+ }
+});
+test('lost CDP connection has a stable error before reading the page',async()=>{
+ const adapter=new (ChatGPTAdapter as any)({isConnected:()=>false},{isClosed:()=>false},()=>{},'unused') as ChatGPTAdapter;
+ await assert.rejects(adapter.getCurrentConversation(),code('DISCONNECTED'));
+});
+
+test('forced disconnect disposes page observation before detaching and never closes a tab',async()=>{
+ const order:string[]=[];const logs:unknown[]=[];
+ const browser={isConnected:()=>true,close:async()=>{order.push('disconnect');}};
+ const page={isClosed:()=>false,evaluate:async()=>{order.push('dispose');}};
+ const adapter=new (ChatGPTAdapter as any)(browser,page,(e:unknown)=>logs.push(e),'/nonexistent-chatgpt-test-lock') as ChatGPTAdapter;
+ (adapter as any).busy=true;
+ await assert.rejects(adapter.disconnect(),code('BUSY'));assert.equal(order.length,0);
+ await adapter.disconnect({force:true});await adapter.disconnect({force:true});
+ assert.deepEqual(order,['dispose','disconnect']);assert(JSON.stringify(logs).includes('observer-cleanup'));
+});

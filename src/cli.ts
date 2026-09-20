@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
-import { ChatGPTAdapter, AdapterError, renderHTML } from './index.js';
+import { diagnosticError } from './diagnostics.js';
+import { ChatGPTAdapter, AdapterError, renderHTML, conversationURL } from './index.js';
 const [command='status', ...args] = process.argv.slice(2);
 if(command==='help'||command==='--help') {
  console.log(`Usage: npm run cli -- <command> [argument]
@@ -17,13 +18,22 @@ CHATGPT_CONVERSATION selects an existing tab by conversation ID or URL.
 CHATGPT_CDP_ENDPOINT defaults to chrome. No browser is launched.
 Each invocation may require Chrome's Allow remote debugging prompt.
 Keep an adapter connection alive in a service to avoid repeated reconnection.
-Output includes content only when requested; diagnostics go to stderr.`);
+Output includes content only when requested. CHATGPT_DIAGNOSTICS=1 enables
+body-free diagnostics on stderr. Errors never include raw Playwright call logs.`);
  process.exit(0);
 }
 const abort=new AbortController();process.once('SIGINT',()=>abort.abort());
 let adapter:ChatGPTAdapter|undefined;
 try {
- adapter=await ChatGPTAdapter.connect({endpoint:process.env.CHATGPT_CDP_ENDPOINT,tabURL:process.env.CHATGPT_TAB_URL,conversation:process.env.CHATGPT_CONVERSATION});
+ if(!['status','current','turns','list','open','new','send','send-file'].includes(command))throw new AdapterError('INVALID_COMMAND','Unknown command. Run help for supported commands.');
+ if((command==='open'||command==='send-file')&&!args[0])throw new AdapterError('INVALID_ARGUMENT','A conversation or file argument is required.');
+ if(command==='open')conversationURL(args[0]);
+ if(command==='list'&&args[0]!==undefined&&!Number.isFinite(Number(args[0])))throw new AdapterError('INVALID_LIMIT','History limit must be a finite number.');
+ let message:string|undefined;
+ if(command==='send')message=args.join(' ');
+ if(command==='send-file'){try{message=await readFile(args[0]==='-'?'/dev/stdin':args[0],'utf8');}catch{throw new AdapterError('MESSAGE_READ_FAILED','Could not read the message file or standard input.');}}
+ if(message!==undefined&&!message.trim())throw new AdapterError('EMPTY_MESSAGE','Message must not be empty.');
+ adapter=await ChatGPTAdapter.connect({logger:process.env.CHATGPT_DIAGNOSTICS==='1'?e=>process.stderr.write(JSON.stringify(e)+'\n'):undefined,endpoint:process.env.CHATGPT_CDP_ENDPOINT,tabURL:process.env.CHATGPT_TAB_URL,conversation:process.env.CHATGPT_CONVERSATION});
  const print=(value:unknown)=>process.stdout.write(JSON.stringify(value)+'\n');
  switch(command) {
   case 'status':print(await adapter.getStatus());break;
@@ -33,11 +43,10 @@ try {
   case 'open':if(!args[0])throw new Error('Missing conversation ID or URL');print(await adapter.openConversation(args[0]));break;
   case 'new':print(await adapter.createConversation());break;
   case 'send':case 'send-file':{
-   const text=command==='send'?args.join(' '):args[0]==='-'?await readFile('/dev/stdin','utf8'):await readFile(args[0],'utf8');
-   for await(const event of adapter.sendMessage(text,{signal:abort.signal}))print(event.type==='done'?{...event,html:renderHTML(event.turn.content)}:event);
+   for await(const event of adapter.sendMessage(message!,{signal:abort.signal}))print(event.type==='done'?{...event,html:renderHTML(event.turn.content)}:event);
    break;
   }
   default:throw new Error(`Unknown command: ${command}. Use help.`);
  }
-}catch(e){process.stderr.write(JSON.stringify({error:e instanceof AdapterError?e.code:'ERROR',message:e instanceof Error?e.message:String(e),...(e instanceof AdapterError?{details:e.details}:{})})+'\n');process.exitCode=1;}
+}catch(e){process.stderr.write(JSON.stringify(diagnosticError(e))+'\n');process.exitCode=1;}
 finally{await adapter?.disconnect();}

@@ -6,11 +6,11 @@ import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ConversationGuard, idFromURL, provisionalID, isChatSurfaceURL } from './conversation.js';
 import { locators } from './selectors.js';
+import { safeLogger } from './diagnostics.js';
 import { AdapterError, type Conversation, type Status, type Turn, type ResponseEvent, type SendOptions, type Logger, type RecentConversations } from './types.js';
 
 const runtimeSource = readFile(new URL('./dom-runtime.js', import.meta.url), 'utf8');
 const KEY = '__chatgptDOMAdapter_v1';
-const logDefault: Logger = e => process.stderr.write(JSON.stringify(e)+'\n');
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9-]{7,127}$/;
 export function conversationURL(value: string): string {
   if (ID.test(value)) return `https://chatgpt.com/c/${value}`;
@@ -21,20 +21,21 @@ export function conversationURL(value: string): string {
 }
 function isChatGPT(url:string):boolean {try{return new URL(url).origin==='https://chatgpt.com';}catch{return false;}}
 export interface ConnectOptions { endpoint?: string; conversation?: string; tabURL?: string; logger?: Logger; timeoutMs?: number }
-interface Drain {updates:{sequence:number;text:string;elapsedMs:number;observedAt:number}[];userId:string|null;assistantId:string|null;seenGenerating:boolean;done:boolean;error:string|null;turn?:Turn;snapshot?:Turn;evidence:string[]}
+interface ObservationDiagnostics {samples:number;mutationBatches:number;droppedSnapshots:number;generating:boolean;userDetected:boolean;assistantDetected:boolean}
+interface Drain {diagnostics?:ObservationDiagnostics;updates:{sequence:number;text:string;elapsedMs:number;observedAt:number}[];userId:string|null;assistantId:string|null;seenGenerating:boolean;done:boolean;error:string|null;turn?:Turn;snapshot?:Turn;evidence:string[]}
 
 export class ChatGPTAdapter {
   private busy=false;
   private closed=false;
   private constructor(private browser:Browser, private page:Page, private log:Logger, private lockPath:string) {}
-  private emit(event:string, details:Record<string,unknown>={}) {this.log({event,at:new Date().toISOString(),...details});}
+  private emit(event:string, details:Record<string,unknown>={}) {safeLogger(this.log)({event,at:new Date().toISOString(),...details});}
   static async connect(options:ConnectOptions={}):Promise<ChatGPTAdapter> {
     const endpoint=options.endpoint??'chrome';
     if(endpoint!=='chrome') {
       let u:URL;try{u=new URL(endpoint);}catch{throw new AdapterError('INVALID_ENDPOINT','Use chrome or a loopback CDP endpoint.');}
       if(!['127.0.0.1','localhost','[::1]'].includes(u.hostname)||!['http:','ws:'].includes(u.protocol)||u.username||u.password)throw new AdapterError('INVALID_ENDPOINT','Only local loopback debugging endpoints are supported.');
     }
-    const log=options.logger??logDefault;
+    const log=safeLogger(options.logger);
     log({event:'connecting',at:new Date().toISOString()});
     const browser=await chromium.connectOverCDP(endpoint,{noDefaults:true,timeout:options.timeoutMs??60000});
     let lockPath:string|undefined;
@@ -53,10 +54,10 @@ export class ChatGPTAdapter {
       try {const f=await open(lockPath,'wx',0o600);await f.writeFile(String(process.pid));await f.close();}
       catch(e) {if((e as NodeJS.ErrnoException).code==='EEXIST') {lockPath=undefined;throw new AdapterError('TAB_LOCKED','Another adapter may own this tab. If a previous adapter crashed, inspect and remove its stale lock in the system temporary directory.');}throw e;}
       const adapter=new ChatGPTAdapter(browser,page,log,lockPath);
-      await adapter.inject();adapter.emit('connected',{browserVersion:browser.version()});return adapter;
+      await adapter.inject();await adapter.call('dispose');adapter.emit('connected',{browserVersion:browser.version()});return adapter;
     } catch(e) {await browser.close();if(lockPath)await unlink(lockPath).catch(()=>{});throw e;}
   }
-  private assertPage() {if(this.closed||this.page.isClosed())throw new AdapterError('DISCONNECTED','The selected page or adapter is closed.');if(!isChatGPT(this.page.url()))throw new AdapterError('WRONG_PAGE','The selected tab has left chatgpt.com.');}
+  private assertPage() {if(this.closed||!this.browser.isConnected()||this.page.isClosed())throw new AdapterError('DISCONNECTED','The selected page or adapter is closed.');if(!isChatSurfaceURL(this.page.url()))throw new AdapterError('WRONG_PAGE','The selected tab is no longer on a supported ChatGPT conversation surface.');}
   private async inject() {this.assertPage();await this.page.evaluate(await runtimeSource);}
   private async call<T>(method:string,arg?:unknown):Promise<T> {
     this.assertPage();
@@ -81,7 +82,7 @@ export class ChatGPTAdapter {
     throw new AdapterError('MISSING_LOCATOR','No supported visible control found.',{selectors:candidates.map(c=>c.name)});
   }
   async getCurrentConversation():Promise<Conversation> {
-    this.assertPage();const url=this.page.url();return {id:provisionalID(idFromURL(url))?null:idFromURL(url),provisional:provisionalID(idFromURL(url)),url,title:await this.page.title(),temporary:new URL(url).searchParams.get('temporary-chat')==='true'};
+    this.assertPage();const url=this.page.url();const title=await this.page.title();if(this.page.url()!==url)throw new AdapterError('CONVERSATION_CHANGED','The conversation changed while reading its identity.');return {id:provisionalID(idFromURL(url))?null:idFromURL(url),provisional:provisionalID(idFromURL(url)),url,title,temporary:new URL(url).searchParams.get('temporary-chat')==='true'};
   }
   async getStatus():Promise<Status> {await this.inject();return {connected:this.browser.isConnected(),...await this.call<Omit<Status,'connected'|'conversation'>>('state'),conversation:await this.getCurrentConversation()};}
   async readVisibleTurns():Promise<Turn[]> {await this.inject();return this.call('readTurns');}
@@ -142,7 +143,7 @@ export class ChatGPTAdapter {
     this.enter();const requestId=options.requestId??randomUUID();const started=Date.now();let observing=false;let clicked=false;let submitted=false;let navigationUnexpected=false;
     let conversation:Conversation|undefined;
     let guard:ConversationGuard|undefined;
-    let deliveredUpdates=0;let maxDeliveryDelayMs=0;
+    let deliveredUpdates=0;let maxDeliveryDelayMs=0;let lastProgressAt=started;let diagnostics:ObservationDiagnostics|undefined;
     const navigation=(frame:import('playwright').Frame)=>{
       if(frame!==this.page.mainFrame()||!conversation)return;
       const current=this.page.url();
@@ -157,6 +158,11 @@ export class ChatGPTAdapter {
       await this.call('observe',{requestId,baselineIds:baseline.map(t=>t.id),expectedText:text,settleMs:700,includeContentSnapshots:options.includeContentSnapshots??false});observing=true;
       this.page.on('framenavigated',navigation);
       if(options.signal?.aborted)throw new AdapterError('ABORTED','Request aborted before sending.');
+      // Recheck after focus/DOM observation, before touching any composer content.
+      if(navigationUnexpected||this.page.url()!==conversation.url)throw new AdapterError('CONVERSATION_CHANGED','The conversation changed before filling the composer.');
+      const draft=await composer.evaluate(e => e instanceof HTMLTextAreaElement ? e.value : (e as HTMLElement).innerText);
+      if(draft.trim())throw new AdapterError('DRAFT_PRESENT','A draft appeared before filling the composer; it will not be overwritten.');
+      if(navigationUnexpected||this.page.url()!==conversation.url)throw new AdapterError('CONVERSATION_CHANGED','The conversation changed before filling the composer.');
       await composer.fill(text,{timeout:5000});
       if(this.page.url()!==conversation.url)throw new AdapterError('CONVERSATION_CHANGED','The conversation changed before submission; no automatic retry.');
       const send=await this.unique(locators.send(this.page),5000);
@@ -173,6 +179,8 @@ export class ChatGPTAdapter {
         if(navigationUnexpected)throw new AdapterError('CONVERSATION_CHANGED','The tab navigated away during generation.');
         let d:Drain;
         try{d=await this.call<Drain>('drain',requestId);}catch{throw new AdapterError('OBSERVER_LOST','The page reloaded or disconnected during generation. Do not resend automatically.');}
+        diagnostics=d.diagnostics;
+        if(Date.now()-lastProgressAt>=10000){lastProgressAt=Date.now();this.emit('observation-progress',{requestId,elapsedMs:Date.now()-started,deliveredUpdates,...diagnostics});}
         if(d.error)throw new AdapterError('GENERATION_FAILED','ChatGPT response could not be verified.',{reason:d.error});
         if(d.userId&&!submitted) {submitted=true;const current=await this.getCurrentConversation();if(conversation.id===null&&current.id)conversation=current;yield {type:'submitted',requestId,conversation:current};}
         for(const update of d.updates){deliveredUpdates++;maxDeliveryDelayMs=Math.max(maxDeliveryDelayMs,Date.now()-update.observedAt);yield {type:'text',requestId,...update};}
@@ -180,7 +188,7 @@ export class ChatGPTAdapter {
         if(d.done&&d.turn) {
           const current=await this.getCurrentConversation();
           if(!guard.accept(current.url))throw new AdapterError('CONVERSATION_CHANGED','Conversation changed before completion.');
-          this.emit('response-complete',{requestId,elapsedMs:Date.now()-started,characters:d.turn.content.text.length,deliveredUpdates,maxDeliveryDelayMs,evidence:d.evidence});
+          this.emit('response-complete',{requestId,elapsedMs:Date.now()-started,characters:d.turn.content.text.length,deliveredUpdates,maxDeliveryDelayMs,...diagnostics,evidence:d.evidence});
           yield {type:'done',requestId,conversation:current,turn:d.turn,elapsedMs:Date.now()-started,completionEvidence:d.evidence};return;
         }
         if(!submitted&&Date.now()-started>15000)throw new AdapterError('SUBMISSION_UNCONFIRMED','No matching user turn appeared. Inspect the page before any retry.');
@@ -188,12 +196,20 @@ export class ChatGPTAdapter {
       }
       throw new AdapterError('GENERATION_TIMEOUT','No verified completion before timeout; ChatGPT may still be generating.');
     } catch(error) {
-      this.emit('operation-failed',{requestId,code:error instanceof AdapterError?error.code:'PLAYWRIGHT_ERROR',submissionAttempted:clicked,submissionConfirmed:submitted});throw error;
+      this.emit('operation-failed',{requestId,code:error instanceof AdapterError?error.code:'PLAYWRIGHT_ERROR',submissionAttempted:clicked,submissionConfirmed:submitted,elapsedMs:Date.now()-started,deliveredUpdates,...diagnostics});throw error;
     } finally {this.page.off('framenavigated',navigation);if(observing)await this.call('stop',requestId).catch(()=>{});this.busy=false;}
   }
   async disconnect(options:{force?:boolean}={}):Promise<void> {
     if(this.busy&&!options.force)throw new AdapterError('BUSY','Finish or cancel the active iterator before disconnecting.');
     if(this.closed)return;this.closed=true;
+    // Release page-side observer state before detaching, including forced shutdown.
+    // Bound this best-effort step when the page is unresponsive.
+    if(this.browser.isConnected()&&!this.page.isClosed()) {
+      let timer:NodeJS.Timeout|undefined;
+      const cleanup=this.page.evaluate(key=>{(window as unknown as Record<string,any>)[key]?.dispose?.();},KEY).then(()=>true,()=>false);
+      const cleaned=await Promise.race([cleanup,new Promise<boolean>(resolve=>{timer=setTimeout(()=>resolve(false),1000);timer.unref();})]);
+      clearTimeout(timer);this.emit('observer-cleanup',{cleaned});
+    }
     try {await this.browser.close();} finally {await unlink(this.lockPath).catch(()=>{});this.emit('disconnected');}
   }
 }

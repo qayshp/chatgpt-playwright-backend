@@ -101,3 +101,32 @@ test('opt-in normalized snapshots include structural changes even when text is u
   assert.equal(r.drain('structured').snapshot,undefined);
  }finally{dom.window.close();}
 });
+
+test('an empty replacement clears prior text instead of leaving a stale answer',()=>{
+ const {dom,w,r}=fixture();try {
+  r.observe({requestId:'r',baselineIds:[],expectedText:'Test',settleMs:0});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',user+answer('Withdrawn text'));
+  assert.equal(r.drain('r').updates[0].text,'Withdrawn text');
+  w.document.querySelector('.markdown p')!.textContent='';
+  const d=r.drain('r');assert.equal(d.updates.length,1);assert.equal(d.updates[0].text,'');assert.equal(d.done,false);
+  assert.equal(d.diagnostics.userDetected,true);assert.equal(d.diagnostics.assistantDetected,true);
+  assert(!JSON.stringify(d.diagnostics).includes('Withdrawn'));assert(!JSON.stringify(d.diagnostics).includes('Test'));
+ }finally{dom.window.close();}
+});
+test('structural changes reset completion settling even if plain text does not change',()=>{
+ const {dom,w,r}=fixture();try {
+  let now=1000;w.Date.now=()=>now;
+  r.observe({requestId:'r',baselineIds:[],expectedText:'Test',settleMs:100});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',user+answer('Same words',true));
+  assert.equal(r.drain('r').done,false);now+=101;assert.equal(r.drain('r').done,true);
+  const p=w.document.querySelector('.markdown p')!;const h=w.document.createElement('h2');h.textContent=p.textContent;p.replaceWith(h);
+  assert.equal(r.drain('r').done,false);now+=101;assert.equal(r.drain('r').done,true);
+ }finally{dom.window.close();}
+});
+test('hidden branches do not become visible turns or competing replies',()=>{
+ const {dom,w,r}=fixture();try {
+  r.observe({requestId:'r',baselineIds:[],expectedText:'Test',settleMs:0});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',user+answer('Visible',true)+'<div hidden>'+user.replace('data-message-id="u"','data-message-id="hidden-user"')+answer('Hidden',true).replace('data-message-id="a"','data-message-id="hidden-answer"')+'</div>');
+  const d=r.drain('r');assert.equal(d.error,null);assert.equal(d.done,true);assert.equal(d.turn.content.text,'Visible');assert.equal(r.readTurns().length,2);
+ }finally{dom.window.close();}
+});
