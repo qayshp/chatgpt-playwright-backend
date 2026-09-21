@@ -4,6 +4,7 @@ import type { Status, Conversation, Turn, RecentConversations, ResponseEvent, Se
 import { conversationURL } from '../adapter.js';
 import { ServiceError, publicError, errorJSON, fromStatus, type HealthState } from './errors.js';
 import { OperationStore, type Operation, type OperationView, type Limits, terminal } from './operations.js';
+import { protectRequest, type TailscaleAccess } from './access.js';
 
 /** Only this transport-independent port couples the service to the browser library. */
 export interface AdapterPort {
@@ -17,6 +18,7 @@ export interface AdapterPort {
   disconnect(options?: { force?: boolean }): Promise<void>;
 }
 export interface ServiceOptions {
+  tailscale?: TailscaleAccess;
   connect: () => Promise<AdapterPort>;
   logger?: Logger;
   limits?: Partial<Limits>;
@@ -262,11 +264,7 @@ export class ChatGPTService {
     return op.view;
   }
   private protect(req: IncomingMessage) {
-    const host = req.headers.host;
-    if (host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) throw new ServiceError('HOST_FORBIDDEN', 'Unrecognized local Host header.', 403);
-    const origin = req.headers.origin;
-    if (origin && origin !== `http://${host}`) throw new ServiceError('ORIGIN_FORBIDDEN', 'Cross-origin requests are not allowed.', 403);
-    if (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(String(req.headers['sec-fetch-site']))) throw new ServiceError('ORIGIN_FORBIDDEN', 'Cross-site requests are not allowed.', 403);
+    protectRequest(req, this.port, this.options.tailscale);
   }
   private async route(req: IncomingMessage, res: ServerResponse) {
     this.protect(req);

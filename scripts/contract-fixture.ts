@@ -1,3 +1,4 @@
+import { tailscaleAccess } from '../src/service/access.js';
 /** Synthetic contract server for the Go integration test. Never connects to Chrome. */
 import { setTimeout as delay } from 'node:timers/promises';
 import { ChatGPTService, type AdapterPort } from '../src/service/service.js';
@@ -77,7 +78,7 @@ class ContractAdapter implements AdapterPort {
 }
 
 const adapter = new ContractAdapter();
-const service = new ChatGPTService({ connect: async () => { adapter.connects++; return adapter; }, heartbeatMs: 100 });
+const service = new ChatGPTService({ connect: async () => { adapter.connects++; return adapter; }, heartbeatMs: 100, tailscale: tailscaleAccess(process.env.CHATGPT_TAILSCALE_ORIGIN, process.env.CHATGPT_TAILSCALE_CLIENT_IPS) });
 const baseURL = await service.start(0);
 await service.ready;
 process.stdout.write(JSON.stringify({ fixture: fixtureName, baseURL }) + '\n');

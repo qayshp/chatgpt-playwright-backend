@@ -20,6 +20,8 @@ For a non-default profile/debugging setup, `CHATGPT_CDP_ENDPOINT` can specify a 
 
 ## Foreground local service
 
+For ColorBerry access through this laptop's tailnet HTTPS name, use `npm run service:tailscale`; see [Tailscale setup and access controls](docs/TAILSCALE.md). The listener remains loopback-only. Plain `npm run service` retains local-only access.
+
 ```sh
 npm run service
 # Equivalent direct command for later supervision:
@@ -32,7 +34,7 @@ Use `GET /status`, `GET /conversation`, `GET /conversations/recent`, `GET /turns
 
 See [the HTTP/SSE contract](docs/HTTP_API.md) for complete routes, JSON/event shapes, retention, health states, cancellation, security, and environment variables. [Service verification](docs/SERVICE_VERIFICATION.md) separates fixture coverage from live browser results.
 
-Sends activate the selected ChatGPT tab before clicking its accessible Send button. This can change the foreground tab: live testing found background-tab submission unreliable. Cancellation stops observation only; it does not press ChatGPT's Stop button. The service keeps operation contents in bounded memory for recovery, never in a disk cache. It trusts local processes and is not ready for remote exposure.
+Sends activate the selected ChatGPT tab before clicking its accessible Send button. This can change the foreground tab: live testing found background-tab submission unreliable. Cancellation stops observation only; it does not press ChatGPT's Stop button. The service keeps operation contents in bounded memory for recovery, never in a disk cache. It trusts local processes; remote access requires the explicit Tailscale Serve configuration described above.
 
 ## Command line
 

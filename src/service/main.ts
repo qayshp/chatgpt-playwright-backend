@@ -1,6 +1,7 @@
 import { ChatGPTService } from './service.js';
 import { connectLocalAdapter } from './connect.js';
 import { publicError, errorJSON } from './errors.js';
+import { tailscaleAccess } from './access.js';
 
 if (process.argv.includes('--help')) {
   console.log(`Foreground ChatGPT HTTP/SSE service
@@ -10,6 +11,8 @@ Binds only to 127.0.0.1. CHATGPT_SERVICE_PORT defaults to 3210.
 CHATGPT_TAB_URL or CHATGPT_CONVERSATION selects an already open tab.
 CHATGPT_CDP_ENDPOINT defaults to chrome (only loopback endpoints allowed).
 CHATGPT_DIAGNOSTICS=1 enables body-free adapter/operation diagnostics.
+CHATGPT_TAILSCALE_ORIGIN and CHATGPT_TAILSCALE_CLIENT_IPS enable trusted Serve access.
+Use npm run service:tailscale to load the ignored .env.tailscale configuration.
 Chrome may ask you to approve remote debugging. GET /status remains available.
 SIGINT/SIGTERM shuts down the service without closing Chrome.
 No daemon, automatic reconnect, credentials, or on-disk response cache.
@@ -19,6 +22,7 @@ See docs/HTTP_API.md for routes, SSE replay, limits, and cancellation semantics.
 const diagnostic = process.env.CHATGPT_DIAGNOSTICS === '1';
 const log = (value: unknown) => process.stderr.write(JSON.stringify(value) + '\n');
 const service = new ChatGPTService({
+  tailscale: tailscaleAccess(process.env.CHATGPT_TAILSCALE_ORIGIN, process.env.CHATGPT_TAILSCALE_CLIENT_IPS),
   connect: () => connectLocalAdapter({
     endpoint: process.env.CHATGPT_CDP_ENDPOINT,
     tabURL: process.env.CHATGPT_TAB_URL,

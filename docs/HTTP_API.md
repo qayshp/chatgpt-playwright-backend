@@ -1,5 +1,7 @@
 # Local HTTP/SSE contract — version 1
 
+Optional Tailscale Serve access uses the same routes and SSE contract. See [TAILSCALE.md](TAILSCALE.md) for the explicit HTTPS origin/client-IP allowlist and startup command. Default startup remains local-only. Unauthorized proxied requests receive 403 `TAILSCALE_FORBIDDEN` before any browser action.
+
 ## Running and ownership
 
 ```sh
@@ -193,7 +195,7 @@ Run `CHATGPT_DIAGNOSTICS=1 npm run service` in the foreground while reproducing 
 
 For an issue report, capture the HTTP status and `X-Request-ID`, operation ID if one was allocated, sanitized `/status` fields (`state`, `busy`, `instanceId`, error code), and matching metadata log lines. `/status` can contain a conversation title/URL; avoid pasting its full response unless you intend to share those details. Logging is an optional observer: failures in a supplied logging callback do not interrupt browser actions or HTTP/SSE handling.
 
-Strict loopback Host validation and Origin/Fetch-Metadata checks reject browser cross-origin requests and DNS-rebinding Host names; no CORS allowance is emitted. This phase trusts local processes on the machine and has no bearer-token authentication. Do not reverse-proxy or expose it remotely without adding authenticated transport/access control in a later phase.
+Strict loopback Host validation and Origin/Fetch-Metadata checks reject browser cross-origin requests and DNS-rebinding Host names; no CORS allowance is emitted. This phase trusts local processes on the machine and has no bearer-token authentication. The optional Tailscale Serve mode adds an exact HTTPS origin and client-IP allowlist while retaining these checks; see TAILSCALE.md. Other remote proxy arrangements are unsupported.
 
 ## Testing
 

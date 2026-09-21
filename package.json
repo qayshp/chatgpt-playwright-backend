@@ -8,7 +8,8 @@
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "cli": "tsx src/cli.ts",
-    "service": "tsx src/service/main.ts"
+    "service": "tsx src/service/main.ts",
+    "service:tailscale": "node --env-file=.env.tailscale --import tsx src/service/main.ts"
   },
   "engines": {
     "node": ">=22"
