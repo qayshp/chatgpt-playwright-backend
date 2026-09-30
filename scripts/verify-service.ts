@@ -29,7 +29,7 @@ const first=await api('/messages',{requestId,expectedConversationId:null,message
 let cursor=0;let snapshots=0;let structured=0;let completed=false;const controller=new AbortController();
 for await(const event of events(first.eventsURL,0,controller.signal)) {
   cursor=event.id;if(event.type==='snapshot')snapshots++;if(event.type==='content_snapshot')structured++;
-  assert(!['failed','cancelled','completed'].includes(event.type),'Must disconnect during generation');
+  assert(!['failed','cancelled','completed'].includes(event.type),`Must disconnect during generation; received ${event.type}${event.data?.error?.code ? ': '+event.data.error.code : ''}`);
   if(snapshots>=3){controller.abort();break;}
 }
 const conflict=await fetch(base+'/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:'This incompatible request must never be sent.'})});assert.equal(conflict.status,409);
@@ -40,7 +40,7 @@ for await(const event of events(first.eventsURL,cursor)) {
   assert(event.id>cursor);cursor=event.id;
   if(event.type==='snapshot')snapshots++;if(event.type==='content_snapshot')structured++;
   if(event.type==='completed')completed=true;
-  assert(!['failed','cancelled','reset'].includes(event.type),`Unexpected ${event.type}`);
+  assert(!['failed','cancelled','reset'].includes(event.type),`Unexpected ${event.type}: ${event.data?.error?.code ?? 'no error code'}`);
 }
 assert(completed);assert(structured>0);
 const result=await api(first.resultURL);assert.equal(result.state,'completed');assert.equal(result.result.turn.content.text,result.text);assert(result.result.conversation.id);
@@ -49,6 +49,6 @@ const opened=await api('/conversation/open',{conversation:result.result.conversa
 const turns=await api('/turns');assert(turns.length>=2);
 const second=await api('/messages',{expectedConversationId:opened.id,message:'Second and final disposable service test: give about 70 words describing why a prism separates white light, with a short bullet list. No browsing or tools.'});
 let secondSnapshots=0;let secondCompleted=false;
-for await(const event of events(second.eventsURL)){if(event.type==='snapshot')secondSnapshots++;if(event.type==='completed')secondCompleted=true;assert(!['failed','cancelled'].includes(event.type));}
+for await(const event of events(second.eventsURL)){if(event.type==='snapshot')secondSnapshots++;if(event.type==='completed')secondCompleted=true;assert(!['failed','cancelled'].includes(event.type),`Unexpected ${event.type}: ${event.data?.error?.code ?? 'no error code'}`);}
 assert(secondCompleted);const final=await api('/status');assert.equal(final.state,'usable');assert.equal(final.connectionAttempts,1);assert.equal(final.instanceId,initial.instanceId);
 console.log(JSON.stringify({passed:true,instanceId:final.instanceId,connectionAttempts:final.connectionAttempts,historyCount:recent.conversations.length,first:{snapshotEvents:snapshots,structuredSnapshots:structured,disconnectedAtEvent:disconnectedAt,lastEvent:cursor,reconnectedDuringGeneration:true,lateReplayCompleted:true,blockTypes:result.result.turn.content.blocks.map((b:any)=>b.type)},second:{snapshotEvents:secondSnapshots,completed:secondCompleted},authenticated:final.adapterStatus.login==='authenticated',idle:!final.adapterStatus.generating},null,2));

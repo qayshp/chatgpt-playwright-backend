@@ -31,7 +31,7 @@ test('generating, unusable, and wrong-destination pages prevent sending',async()
 });
 test('history waits for initially empty lazy-loaded links instead of returning premature emptiness',async()=>{
  const h=harness();let scans=0;let restored=false;
- h.adapter['page']={url:()=> 'https://chatgpt.com/c/12345678',isClosed:()=>false,getByRole:()=>({isVisible:async()=>true})} as any;
+ h.adapter['page']={url:()=> 'https://chatgpt.com/c/12345678',isClosed:()=>false,getByRole:()=>({filter:()=>({count:async()=>1,isVisible:async()=>true})})} as any;
  h.adapter['call']=async function<T>(_method:string,arg:unknown):Promise<T>{
   if(arg==='restore')restored=true;
   if(arg==='read'){scans++;return {links:scans<2?[]:[{title:'Loaded',url:'https://chatgpt.com/c/12345678'}],scrollable:false,position:0,height:0} as T;}

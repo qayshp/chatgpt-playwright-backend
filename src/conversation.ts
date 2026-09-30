@@ -1,6 +1,10 @@
-export const idFromURL = (url:string):string|null => new URL(url).pathname.match(/\/c\/([^/]+)\/?$/)?.[1]??null;
-export const provisionalID = (id:string|null):boolean => !!id?.startsWith('WEB:');
-/** New chats transition / -> /c/WEB:<uuid> -> /c/<durable-id> in the observed UI. */
+export const idFromURL = (url:string):string|null => {
+  const id=new URL(url).pathname.match(/\/c\/([^/]+)\/?$/)?.[1];
+  if(!id)return null;
+  try{return decodeURIComponent(id);}catch{return id;}
+};
+export const provisionalID = (id:string|null):boolean => !!id && /^(WEB:|local-chatgpt:)/.test(id);
+/** New chats transition / -> /c/WEB:<uuid> or /c/local-chatgpt%3A<uuid> -> /c/<durable-id> in the observed UI. */
 export class ConversationGuard {
   private permanent:string|null;
   private provisional:string|null;
@@ -17,7 +21,7 @@ export class ConversationGuard {
     if(!this.startsNew)return false;
     if(id===null)return u.pathname==='/'&&this.provisional===null;
     if(provisionalID(id)) {
-      if(!/^WEB:[a-f0-9-]+$/i.test(id))return false;
+      if(!/^(?:WEB:|local-chatgpt:)[a-f0-9-]+$/i.test(id))return false;
       if(this.provisional&&this.provisional!==id)return false;
       this.provisional=id;return true;
     }

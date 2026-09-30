@@ -18,7 +18,7 @@ test('status distinguishes authentication, drafts, and ambiguous composers',()=>
  const {dom,w,r}=fixture();try {
   assert.equal(r.state().login,'authenticated');assert.equal(r.state().usable,true);
   w.document.querySelector('#prompt-textarea')!.textContent='unsent draft';assert.equal(r.state().draftPresent,true);
-  w.document.querySelector('main')!.insertAdjacentHTML('beforeend','<div role="textbox" contenteditable="true"></div>');assert.equal(r.state().usable,false);assert.equal(r.state().composerCount,2);
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend','<div role="textbox" contenteditable="true" aria-label="Ask ChatGPT"></div>');assert.equal(r.state().usable,false);assert.equal(r.state().composerCount,2);
   w.document.body.insertAdjacentHTML('beforeend','<button>Log in</button>');assert.equal(r.state().login,'logged-out');
  }finally{dom.window.close();}
 });
@@ -128,5 +128,72 @@ test('hidden branches do not become visible turns or competing replies',()=>{
   r.observe({requestId:'r',baselineIds:[],expectedText:'Test',settleMs:0});
   w.document.querySelector('main')!.insertAdjacentHTML('beforeend',user+answer('Visible',true)+'<div hidden>'+user.replace('data-message-id="u"','data-message-id="hidden-user"')+answer('Hidden',true).replace('data-message-id="a"','data-message-id="hidden-answer"')+'</div>');
   const d=r.drain('r');assert.equal(d.error,null);assert.equal(d.done,true);assert.equal(d.turn.content.text,'Visible');assert.equal(r.readTurns().length,2);
+ }finally{dom.window.close();}
+});
+
+test('rollout profile control authenticates only in app navigation and honors logged-out state',()=>{
+ const {dom,w,r}=fixture();try {
+  w.document.querySelector('[data-testid="accounts-profile-button"]')!.remove();
+  w.document.body.insertAdjacentHTML('beforeend','<button aria-label="Open profile menu"></button>');
+  assert.equal(r.state().login,'unknown','unrelated profile text is not authentication evidence');
+  w.document.body.insertAdjacentHTML('beforeend','<nav aria-label="App navigation"><button aria-label="Open profile menu"></button></nav>');
+  assert.equal(r.state().login,'authenticated');assert.equal(r.state().usable,true);
+  w.document.querySelector('nav')!.hidden=true;assert.equal(r.state().login,'unknown');
+  w.document.querySelector('nav')!.hidden=false;
+  w.document.body.insertAdjacentHTML('beforeend','<button>Log in</button>');assert.equal(r.state().login,'logged-out');
+ }finally{dom.window.close();}
+});
+
+test('both history layouts scope links, reject ambiguity, and restore lazy-list scrolling',()=>{
+ for(const label of ['Chat history','Home']) {
+  const {dom,w,r}=fixture();try {
+   w.document.body.insertAdjacentHTML('beforeend',`<a href="/c/outside">Outside</a><nav aria-label="${label}"><div style="overflow-y:auto"><a href="/c/12345678">Test chat</a></div></nav><nav aria-label="Home" hidden><a href="/c/hidden">Hidden</a></nav>`);
+   const scroller=w.document.querySelector('nav div')!;
+   Object.defineProperties(scroller,{clientHeight:{value:100},scrollHeight:{value:1000}});scroller.scrollTop=90;
+   r.history('start');assert.equal(scroller.scrollTop,0);
+   let scan=r.history('read');assert.equal(scan.links.length,1);assert.equal(scan.links[0].title,'Test chat');assert.equal(scan.scrollable,true);
+   r.history('scroll');assert.equal(scroller.scrollTop,200);
+   scroller.innerHTML='<a href="/c/87654321">Next chat</a>';assert.equal(r.history('read').links[0].title,'Next chat');
+   r.history('restore');assert.equal(scroller.scrollTop,90);
+   w.document.body.insertAdjacentHTML('beforeend','<nav aria-label="Home"></nav>');assert.throws(()=>r.history('read'),/ambiguous/);
+  }finally{dom.window.close();}
+ }
+});
+
+test('editable answer code is not a second composer or unsent message draft',()=>{
+ const {dom,w,r}=fixture('<div role="textbox" contenteditable="true" aria-label="Edit code">print("sample")</div>');try {
+  assert.equal(r.state().composerCount,1);assert.equal(r.state().draftPresent,false);assert.equal(r.state().usable,true);
+  w.document.querySelector('#prompt-textarea')!.remove();
+  assert.equal(r.state().composerCount,0);assert.equal(r.state().usable,false);
+ }finally{dom.window.close();}
+});
+
+const rolloutTurn=(id='a', text='Partial')=>`<div data-turn-key="turn-${id}"><div data-chatgpt-search-unit-key="turn:0:user" data-chatgpt-search-message-ids="u-${id}"><div data-user-message-bubble="true">Test</div><button aria-label="Copy message"></button></div><div data-chatgpt-search-unit-key="turn:2:assistant" data-chatgpt-search-message-ids="${id} ${id}"><h4 class="sr-only" data-conversation-role="assistant">Assistant</h4><div data-markdown-text-style="assistant-message"><h2>Answer</h2><p>${text}</p><div data-markdown-copy="code-block"><div data-markdown-copy="exclude">Python<button aria-label="Copy">Copy</button><button>Run code</button></div><div role="textbox" aria-label="Edit code" contenteditable="true" data-language="python"><div class="cm-line">print(1)</div><div class="cm-line">print(2)</div></div></div></div></div></div>`;
+
+test('rollout turns stream replacements and require their own non-code completion toolbar',()=>{
+ const {dom,w,r}=fixture();try {
+  r.observe({requestId:'r',baselineIds:[],expectedText:'Test',settleMs:0,includeContentSnapshots:true});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',rolloutTurn());
+  let d=r.drain('r');assert.equal(d.userId,'u-a');assert.equal(d.assistantId,'a');assert.equal(d.done,false,'code Copy is not completion');
+  assert.deepEqual(Array.from(r.readTurns(),(t:any)=>t.role),['user','assistant']);
+  const answer=r.readTurns()[1].content;assert.equal(answer.blocks[2].type,'code');assert.equal(answer.blocks[2].text,'print(1)\nprint(2)');assert.equal(answer.blocks[2].language,'python');assert(!answer.text.includes('Run code'));assert(!answer.text.includes('Python'));assert(answer.text.includes('print(1)\nprint(2)'));
+  w.document.querySelector('[data-markdown-text-style] p')!.textContent='Revised';d=r.drain('r');assert(d.updates.at(-1).text.includes('Revised'));
+  w.document.querySelector('[data-chatgpt-search-unit-key$=":assistant"]')!.insertAdjacentHTML('beforeend','<button aria-label="Copy"></button>');
+  assert.equal(r.drain('r').done,false,'Copy inside answer content is not a completion toolbar');
+  w.document.querySelector('[data-turn-key]')!.insertAdjacentHTML('beforeend','<button aria-label="Copy"></button>');
+  w.document.body.insertAdjacentHTML('beforeend','<form data-chatgpt-composer><button aria-label="Stop"></button></form>');
+  assert.equal(r.state().generating,true);assert.equal(r.drain('r').done,false);
+  w.document.querySelector('form')!.remove();assert.equal(r.drain('r').done,true);
+ }finally{dom.window.close();}
+});
+
+test('rollout completion cannot borrow an old answer toolbar or ambiguous message identity',()=>{
+ const {dom,w,r}=fixture(rolloutTurn('old'));try {
+  w.document.querySelector('[data-turn-key]')!.insertAdjacentHTML('beforeend','<button aria-label="Copy"></button>');
+  r.observe({requestId:'r',baselineIds:['u-old','old'],expectedText:'Test',settleMs:0});
+  w.document.querySelector('main')!.insertAdjacentHTML('beforeend',rolloutTurn('new'));
+  assert.equal(r.drain('r').done,false);
+  w.document.querySelector('[data-chatgpt-search-message-ids="new new"]')!.setAttribute('data-chatgpt-search-message-ids','new other');
+  assert.equal(r.drain('r').error,'ambiguous-message-identity');assert.throws(()=>r.readTurns(),/ambiguous/);
  }finally{dom.window.close();}
 });

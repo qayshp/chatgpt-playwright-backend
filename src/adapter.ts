@@ -119,6 +119,7 @@ export class ChatGPTAdapter {
     this.enter();let started=false;
     try {
       const status=await this.getStatus();if(!status.usable)throw new AdapterError('PAGE_UNUSABLE','Chat history is unavailable.',{reason:status.reason});
+      if(await locators.history(this.page).count()>1)throw new AdapterError('HISTORY_UNAVAILABLE','Chat history is ambiguous.');
       if(!(await locators.history(this.page).isVisible())) {const button=locators.openSidebar(this.page);if(await button.count()!==1)throw new AdapterError('HISTORY_UNAVAILABLE','Open the chat sidebar before listing conversations.');await button.click();await locators.history(this.page).waitFor({state:'visible'});}
       type Scan={links:{title:string;url:string}[];scrollable:boolean;position:number;height:number};
       await this.call('history','start');started=true;await delay(150);

@@ -115,14 +115,16 @@ Page-side DOM knowledge is in `src/dom-runtime.js`. Semantic Playwright locators
 | Purpose | Current assumption |
 | --- | --- |
 | Composer | One visible textbox labelled `Chat with ChatGPT`, `Message ChatGPT`, or `Ask ChatGPT`; fallback `#prompt-textarea` |
-| Send | Button named `Send message` or `Send prompt`; fallback `data-testid="send-button"` |
-| Authentication | Visible `data-testid="accounts-profile-button"` and no visible Log in/Sign in/Sign up control |
+| Send | Button named `Send`, `Send message`, or `Send prompt`; fallback `data-testid="send-button"` |
+| Authentication | Visible `data-testid="accounts-profile-button"` or `Open profile menu` button inside `App navigation`, and no visible Log in/Sign in/Sign up control |
 | Conversation | ChatGPT URL containing `/c/<id>`, optionally under a custom GPT path |
-| Turns | `data-message-author-role` and `data-message-id` attributes, inside `[data-testid^="conversation-turn-"]`; legacy `article` fallback |
-| Answer body | `.markdown` inside a message; non-markdown thinking placeholders are not streamed as answer text. Completed non-markdown content falls back to semantic descendants and text |
-| Generation | Stop generating/Stop streaming button or `data-testid="stop-button"` |
-| Completion | New matching assistant turn, its Copy response/copy-turn-action-button control, no stop control or streaming marker, and text plus normalized content settled for 700 ms; controls must belong to the new assistant turn |
-| Recent chats | Navigation region named `Chat history`, conversation anchors, and a scrollable container determined from DOM scroll geometry |
+| Turns | Legacy `data-message-author-role`/`data-message-id`, or rollout `data-chatgpt-search-unit-key` ending in `:user`/`:assistant` with one unique `data-chatgpt-search-message-ids` value; scoped by conversation turn, `article`, or `data-turn-key` |
+| Answer body | `.markdown` or `data-markdown-text-style="assistant-message"` inside a message; non-markdown thinking placeholders are not streamed as answer text. Completed non-markdown content falls back to semantic descendants and text |
+| Generation | Stop generating/Stop streaming button, `data-testid="stop-button"`, or `Stop` within `form[data-chatgpt-composer]` |
+| Completion | New matching assistant turn, its Copy response/copy-turn-action-button control or rollout Copy outside the Markdown/user content, no stop control or streaming marker, and text plus normalized content settled for 700 ms; controls must belong to the new assistant turn |
+| Recent chats | One visible navigation region named `Chat history` or `Home`, conversation anchors, and a scrollable container determined from DOM scroll geometry |
+
+Rollout code widgets (`data-markdown-copy="code-block"`) are normalized from rendered CodeMirror `.cm-line` elements and `data-language`; toolbar text is excluded. Virtualized code can be incomplete and produces a warning when a `.cm-gap` is present. New chats may use an encoded `local-chatgpt:` provisional ID before receiving a durable ID; the guard accepts that transition once and still rejects a switch to another conversation. English accessibility labels and these DOM attributes remain assumptions, not a stable ChatGPT API.
 
 Before sending, the adapter refuses an existing draft, an active generation, a missing/ambiguous composer, a mismatched expected conversation, or an unusable page. It rechecks the destination and draft immediately before filling the composer. It identifies the submitted user turn by new message ID and matching text, then tracks the following new assistant turn. Hidden branches are excluded. It refuses competing user or assistant responses. It detects page reloads/disconnection and navigation away from the selected conversation, including to other products on chatgpt.com. A process lock prevents two instances of this adapter from controlling the same tab; it cannot prevent manual typing or other automation. Avoid editing the selected tab concurrently: DOM checks reduce race windows but cannot make browser interaction atomic.
 
@@ -147,3 +149,5 @@ This prototype targets the English text-chat UI. UI experiments, localized label
 The sibling `chatgpt-tui-frontend` now consumes the documented HTTP/SSE contract through an independent Go client. The next step is a real ColorBerry usability check and authenticated access control before any remote exposure. Keep exercising service recovery against browser UI changes and retain explicit snapshot replacement in every consumer. The browser adapter and normalized content schema remain independent of the TUI and a future Beeper bridge. See [review verification](docs/REVIEW_VERIFICATION.md) for the later reliability pass, separate from the original live-browser evidence below.
 
 Live verification passed on 2026-09-20: new-chat send/stream, direct conversation navigation and a second send/stream, normalized content including real citations, and 60 recent chats across lazy loading. One test delivered 63 snapshots with a measured maximum observation-to-delivery delay of 77 ms. See `VERIFICATION.md` for the evidence and limits of these measurements.
+
+UI rollout verification passed on 2026-09-30 after updating authentication, sidebar, send/stop, provisional URL, turn, and code-block recognition. The successful live run covered two sends, SSE reconnection, direct navigation, and 60 recent chats. See [rollout verification](docs/UI_ROLLOUT_VERIFICATION.md) for measurements, preliminary failures, and remaining limits.

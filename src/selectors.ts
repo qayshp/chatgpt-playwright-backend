@@ -6,9 +6,9 @@ export const locators = {
     {name:'composer-id', locator:p.locator('#prompt-textarea').filter({visible:true})},
   ],
   send: (p: Page) => [
-    {name:'send-role', locator:p.getByRole('button',{name:/^Send (message|prompt)$/i}).filter({visible:true})},
+    {name:'send-role', locator:p.getByRole('button',{name:/^Send(?: (message|prompt))?$/i}).filter({visible:true})},
     {name:'send-testid', locator:p.getByTestId('send-button').filter({visible:true})},
   ],
-  history: (p: Page) => p.getByRole('navigation',{name:'Chat history',exact:true}),
-  openSidebar: (p: Page) => p.getByRole('button',{name:/^Open sidebar$/i}).filter({visible:true}),
+  history: (p: Page) => p.getByRole('navigation',{name:/^(Chat history|Home)$/}).filter({visible:true}),
+  openSidebar: (p: Page) => p.getByRole('button',{name:/^(Open sidebar|Toggle sidebar)$/i}).filter({visible:true}),
 };

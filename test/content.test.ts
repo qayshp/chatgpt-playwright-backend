@@ -38,3 +38,18 @@ test('default tab discovery excludes Codex and other non-chat routes',async()=>{
  assert(!isChatSurfaceURL('https://chatgpt.com/sites'));
  assert(!isChatSurfaceURL('https://example.com/c/12345678'));
 });
+
+test('encoded rollout provisional IDs are not durable and cannot switch conversations',async()=>{
+ const {ConversationGuard,idFromURL,provisionalID}=await import('../src/conversation.js');
+ const pending='https://chatgpt.com/c/local-chatgpt%3A11111111-1111-4111-8111-111111111111';
+ assert(provisionalID(idFromURL(pending)));assert.throws(()=>conversationURL(pending));
+ for(const initial of ['https://chatgpt.com/',pending]) {
+  const g=new ConversationGuard(initial);
+  assert(g.accept(pending));assert(g.accept(pending.replace('%3A',':')));
+  assert(!g.accept(pending.replace('11111111','99999999')));
+  assert(!g.accept('https://chatgpt.com/'));assert(!g.accept('https://chatgpt.com/sites'));
+  assert(g.accept('https://chatgpt.com/c/22222222-2222-4222-8222-222222222222'));
+  assert(!g.accept(pending));assert(!g.accept('https://chatgpt.com/c/33333333-3333-4333-8333-333333333333'));
+ }
+ assert(!new ConversationGuard('https://chatgpt.com/').accept('https://chatgpt.com/c/local-chatgpt%3Anot-a-uuid'));
+});
